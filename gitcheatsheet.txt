@@ -19,3 +19,6 @@ patch -p0 < patchfile
 
 revert file after commit
 git checkout <hash of previous commit to revert to> <file to revert>
+
+git names of staged files:
+git diff --name-only --cached
