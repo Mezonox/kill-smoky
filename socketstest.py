@@ -3,6 +3,9 @@
 import getopt
 import sys
 
+shortopts = "ho:v"
+longopts = ["help", "output="]
+
 def main():
     parseCommandLine()
     
@@ -11,7 +14,7 @@ def useage():
     
 def parseCommandLine():
     try: 
-        opts,args = getopt.getopt(sys.argv[1:], "ho:v", ["help", "output="])
+        opts,args = getopt.getopt(sys.argv[1:], shortopts , longopts)
     except getopt.GetoptError as err:
         #pint help info and exit
         print(err)
