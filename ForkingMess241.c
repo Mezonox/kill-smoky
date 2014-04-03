@@ -1,1938 +1,1939 @@
-/*
- *  linux/kernel/fork.c
- *
- *  Copyright (C) 1991, 1992  Linus Torvalds
- */
-
-/*
- *  'fork.c' contains the help-routines for the 'fork' system call
- * (see also entry.S and others).
- * Fork is rather simple, once you get the hang of it, but the memory
- * management can be a bitch. See 'mm/memory.c': 'copy_page_range()'
- */
-
-#include <linux/slab.h>
-#include <linux/init.h>
-#include <linux/unistd.h>
-#include <linux/module.h>
-#include <linux/vmalloc.h>
-#include <linux/completion.h>
-#include <linux/personality.h>
-#include <linux/mempolicy.h>
-#include <linux/sem.h>
-#include <linux/file.h>
-#include <linux/fdtable.h>
-#include <linux/iocontext.h>
-#include <linux/key.h>
-#include <linux/binfmts.h>
-#include <linux/mman.h>
-#include <linux/mmu_notifier.h>
-#include <linux/fs.h>
-#include <linux/nsproxy.h>
-#include <linux/capability.h>
-#include <linux/cpu.h>
-#include <linux/cgroup.h>
-#include <linux/security.h>
-#include <linux/hugetlb.h>
-#include <linux/seccomp.h>
-#include <linux/swap.h>
-#include <linux/syscalls.h>
-#include <linux/jiffies.h>
-#include <linux/futex.h>
-#include <linux/compat.h>
-#include <linux/kthread.h>
-#include <linux/task_io_accounting_ops.h>
-#include <linux/rcupdate.h>
-#include <linux/ptrace.h>
-#include <linux/mount.h>
-#include <linux/audit.h>
-#include <linux/memcontrol.h>
-#include <linux/ftrace.h>
-#include <linux/proc_fs.h>
-#include <linux/profile.h>
-#include <linux/rmap.h>
-#include <linux/ksm.h>
-#include <linux/acct.h>
-#include <linux/tsacct_kern.h>
-#include <linux/cn_proc.h>
-#include <linux/freezer.h>
-#include <linux/delayacct.h>
-#include <linux/taskstats_kern.h>
-#include <linux/random.h>
-#include <linux/tty.h>
-#include <linux/blkdev.h>
-#include <linux/fs_struct.h>
-#include <linux/magic.h>
-#include <linux/perf_event.h>
-#include <linux/posix-timers.h>
-#include <linux/user-return-notifier.h>
-#include <linux/oom.h>
-#include <linux/khugepaged.h>
-#include <linux/signalfd.h>
-#include <linux/uprobes.h>
-#include <linux/aio.h>
-
-#include <asm/pgtable.h>
-#include <asm/pgalloc.h>
-#include <asm/uaccess.h>
-#include <asm/mmu_context.h>
-#include <asm/cacheflush.h>
-#include <asm/tlbflush.h>
-
-#include <trace/events/sched.h>
-
-#define CREATE_TRACE_POINTS
-#include <trace/events/task.h>
-
-/*
- * Protected counters by write_lock_irq(&tasklist_lock)
- */
-unsigned long total_forks;	/* Handle normal Linux uptimes. */
-int nr_threads;			/* The idle threads do not count.. */
-
-int max_threads;		/* tunable limit on nr_threads */
-
-DEFINE_PER_CPU(unsigned long, process_counts) = 0;
-
-__cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */
-
-#ifdef CONFIG_PROVE_RCU
-int lockdep_tasklist_lock_is_held(void)
-{
-	return lockdep_is_held(&tasklist_lock);
-}
-EXPORT_SYMBOL_GPL(lockdep_tasklist_lock_is_held);
-#endif /* #ifdef CONFIG_PROVE_RCU */
-
-int nr_processes(void)
-{
-	int cpu;
-	int total = 0;
-
-	for_each_possible_cpu(cpu)
-		total += per_cpu(process_counts, cpu);
-
-	return total;
-}
-
-void __weak arch_release_task_struct(struct task_struct *tsk)
-{
-}
-
-#ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR
-static struct kmem_cache *task_struct_cachep;
-
-static inline struct task_struct *alloc_task_struct_node(int node)
-{
-	return kmem_cache_alloc_node(task_struct_cachep, GFP_KERNEL, node);
-}
-
-static inline void free_task_struct(struct task_struct *tsk)
-{
-	kmem_cache_free(task_struct_cachep, tsk);
-}
-#endif
-
-void __weak arch_release_thread_info(struct thread_info *ti)
-{
-}
-
-#ifndef CONFIG_ARCH_THREAD_INFO_ALLOCATOR
-
-/*
- * Allocate pages if THREAD_SIZE is >= PAGE_SIZE, otherwise use a
- * kmemcache based allocator.
- */
-# if THREAD_SIZE >= PAGE_SIZE
-static struct thread_info *alloc_thread_info_node(struct task_struct *tsk,
-						  int node)
-{
-	struct page *page = alloc_pages_node(node, THREADINFO_GFP_ACCOUNTED,
-					     THREAD_SIZE_ORDER);
-
-	return page ? page_address(page) : NULL;
-}
-
-static inline void free_thread_info(struct thread_info *ti)
-{
-	free_memcg_kmem_pages((unsigned long)ti, THREAD_SIZE_ORDER);
-}
-# else
-static struct kmem_cache *thread_info_cache;
-
-static struct thread_info *alloc_thread_info_node(struct task_struct *tsk,
-						  int node)
-{
-	return kmem_cache_alloc_node(thread_info_cache, THREADINFO_GFP, node);
-}
-
-static void free_thread_info(struct thread_info *ti)
-{
-	kmem_cache_free(thread_info_cache, ti);
-}
-
-void thread_info_cache_init(void)
-{
-	thread_info_cache = kmem_cache_create("thread_info", THREAD_SIZE,
-					      THREAD_SIZE, 0, NULL);
-	BUG_ON(thread_info_cache == NULL);
-}
-# endif
-#endif
-
-/* SLAB cache for signal_struct structures (tsk->signal) */
-static struct kmem_cache *signal_cachep;
-
-/* SLAB cache for sighand_struct structures (tsk->sighand) */
-struct kmem_cache *sighand_cachep;
-
-/* SLAB cache for files_struct structures (tsk->files) */
-struct kmem_cache *files_cachep;
-
-/* SLAB cache for fs_struct structures (tsk->fs) */
-struct kmem_cache *fs_cachep;
-
-/* SLAB cache for vm_area_struct structures */
-struct kmem_cache *vm_area_cachep;
-
-/* SLAB cache for mm_struct structures (tsk->mm) */
-static struct kmem_cache *mm_cachep;
-
-static void account_kernel_stack(struct thread_info *ti, int account)
-{
-	struct zone *zone = page_zone(virt_to_page(ti));
-
-	mod_zone_page_state(zone, NR_KERNEL_STACK, account);
-}
-
-void free_task(struct task_struct *tsk)
-{
-	account_kernel_stack(tsk->stack, -1);
-	arch_release_thread_info(tsk->stack);
-	free_thread_info(tsk->stack);
-	rt_mutex_debug_task_free(tsk);
-	ftrace_graph_exit_task(tsk);
-	put_seccomp_filter(tsk);
-	arch_release_task_struct(tsk);
-	free_task_struct(tsk);
-}
-EXPORT_SYMBOL(free_task);
-
-static inline void free_signal_struct(struct signal_struct *sig)
-{
-	taskstats_tgid_free(sig);
-	sched_autogroup_exit(sig);
-	kmem_cache_free(signal_cachep, sig);
-}
-
-static inline void put_signal_struct(struct signal_struct *sig)
-{
-	if (atomic_dec_and_test(&sig->sigcnt))
-		free_signal_struct(sig);
-}
-
-void __put_task_struct(struct task_struct *tsk)
-{
-	WARN_ON(!tsk->exit_state);
-	WARN_ON(atomic_read(&tsk->usage));
-	WARN_ON(tsk == current);
-
-	task_numa_free(tsk);
-	security_task_free(tsk);
-	exit_creds(tsk);
-	delayacct_tsk_free(tsk);
-	put_signal_struct(tsk->signal);
-
-	if (!profile_handoff_task(tsk))
-		free_task(tsk);
-}
-EXPORT_SYMBOL_GPL(__put_task_struct);
-
-void __init __weak arch_task_cache_init(void) { }
-
-void __init fork_init(unsigned long mempages)
-{
-#ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR
-#ifndef ARCH_MIN_TASKALIGN
-#define ARCH_MIN_TASKALIGN	L1_CACHE_BYTES
-#endif
-	/* create a slab on which task_structs can be allocated */
-	task_struct_cachep =
-		kmem_cache_create("task_struct", sizeof(struct task_struct),
-			ARCH_MIN_TASKALIGN, SLAB_PANIC | SLAB_NOTRACK, NULL);
-#endif
-
-	/* do the arch specific task caches init */
-	arch_task_cache_init();
-
-	/*
-	 * The default maximum number of threads is set to a safe
-	 * value: the thread structures can take up at most half
-	 * of memory.
-	 */
-	max_threads = mempages / (8 * THREAD_SIZE / PAGE_SIZE);
-
-	/*
-	 * we need to allow at least 20 threads to boot a system
-	 */
-	if (max_threads < 20)
-		max_threads = 20;
-
-	init_task.signal->rlim[RLIMIT_NPROC].rlim_cur = max_threads/2;
-	init_task.signal->rlim[RLIMIT_NPROC].rlim_max = max_threads/2;
-	init_task.signal->rlim[RLIMIT_SIGPENDING] =
-		init_task.signal->rlim[RLIMIT_NPROC];
-}
-
-int __attribute__((weak)) arch_dup_task_struct(struct task_struct *dst,
-					       struct task_struct *src)
-{
-	*dst = *src;
-	return 0;
-}
-
-static struct task_struct *dup_task_struct(struct task_struct *orig)
-{
-	struct task_struct *tsk;
-	struct thread_info *ti;
-	unsigned long *stackend;
-	int node = tsk_fork_get_node(orig);
-	int err;
-
-	tsk = alloc_task_struct_node(node);
-	if (!tsk)
-		return NULL;
-
-	ti = alloc_thread_info_node(tsk, node);
-	if (!ti)
-		goto free_tsk;
-
-	err = arch_dup_task_struct(tsk, orig);
-	if (err)
-		goto free_ti;
-
-	tsk->stack = ti;
-
-	setup_thread_stack(tsk, orig);
-	clear_user_return_notifier(tsk);
-	clear_tsk_need_resched(tsk);
-	stackend = end_of_stack(tsk);
-	*stackend = STACK_END_MAGIC;	/* for overflow detection */
-
-#ifdef CONFIG_CC_STACKPROTECTOR
-	tsk->stack_canary = get_random_int();
-#endif
-
-	/*
-	 * One for us, one for whoever does the "release_task()" (usually
-	 * parent)
-	 */
-	atomic_set(&tsk->usage, 2);
-#ifdef CONFIG_BLK_DEV_IO_TRACE
-	tsk->btrace_seq = 0;
-#endif
-	tsk->splice_pipe = NULL;
-	tsk->task_frag.page = NULL;
-
-	account_kernel_stack(ti, 1);
-
-	return tsk;
-
-free_ti:
-	free_thread_info(ti);
-free_tsk:
-	free_task_struct(tsk);
-	return NULL;
-}
-
-#ifdef CONFIG_MMU
-static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
-{
-	struct vm_area_struct *mpnt, *tmp, *prev, **pprev;
-	struct rb_node **rb_link, *rb_parent;
-	int retval;
-	unsigned long charge;
-
-	uprobe_start_dup_mmap();
-	down_write(&oldmm->mmap_sem);
-	flush_cache_dup_mm(oldmm);
-	uprobe_dup_mmap(oldmm, mm);
-	/*
-	 * Not linked in yet - no deadlock potential:
-	 */
-	down_write_nested(&mm->mmap_sem, SINGLE_DEPTH_NESTING);
-
-	mm->locked_vm = 0;
-	mm->mmap = NULL;
-	mm->mmap_cache = NULL;
-	mm->map_count = 0;
-	cpumask_clear(mm_cpumask(mm));
-	mm->mm_rb = RB_ROOT;
-	rb_link = &mm->mm_rb.rb_node;
-	rb_parent = NULL;
-	pprev = &mm->mmap;
-	retval = ksm_fork(mm, oldmm);
-	if (retval)
-		goto out;
-	retval = khugepaged_fork(mm, oldmm);
-	if (retval)
-		goto out;
-
-	prev = NULL;
-	for (mpnt = oldmm->mmap; mpnt; mpnt = mpnt->vm_next) {
-		struct file *file;
-
-		if (mpnt->vm_flags & VM_DONTCOPY) {
-			vm_stat_account(mm, mpnt->vm_flags, mpnt->vm_file,
-							-vma_pages(mpnt));
-			continue;
-		}
-		charge = 0;
-		if (mpnt->vm_flags & VM_ACCOUNT) {
-			unsigned long len = vma_pages(mpnt);
-
-			if (security_vm_enough_memory_mm(oldmm, len)) /* sic */
-				goto fail_nomem;
-			charge = len;
-		}
-		tmp = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
-		if (!tmp)
-			goto fail_nomem;
-		*tmp = *mpnt;
-		INIT_LIST_HEAD(&tmp->anon_vma_chain);
-		retval = vma_dup_policy(mpnt, tmp);
-		if (retval)
-			goto fail_nomem_policy;
-		tmp->vm_mm = mm;
-		if (anon_vma_fork(tmp, mpnt))
-			goto fail_nomem_anon_vma_fork;
-		tmp->vm_flags &= ~VM_LOCKED;
-		tmp->vm_next = tmp->vm_prev = NULL;
-		file = tmp->vm_file;
-		if (file) {
-			struct inode *inode = file_inode(file);
-			struct address_space *mapping = file->f_mapping;
-
-			get_file(file);
-			if (tmp->vm_flags & VM_DENYWRITE)
-				atomic_dec(&inode->i_writecount);
-			mutex_lock(&mapping->i_mmap_mutex);
-			if (tmp->vm_flags & VM_SHARED)
-				mapping->i_mmap_writable++;
-			flush_dcache_mmap_lock(mapping);
-			/* insert tmp into the share list, just after mpnt */
-			if (unlikely(tmp->vm_flags & VM_NONLINEAR))
-				vma_nonlinear_insert(tmp,
-						&mapping->i_mmap_nonlinear);
-			else
-				vma_interval_tree_insert_after(tmp, mpnt,
-							&mapping->i_mmap);
-			flush_dcache_mmap_unlock(mapping);
-			mutex_unlock(&mapping->i_mmap_mutex);
-		}
-
-		/*
-		 * Clear hugetlb-related page reserves for children. This only
-		 * affects MAP_PRIVATE mappings. Faults generated by the child
-		 * are not guaranteed to succeed, even if read-only
-		 */
-		if (is_vm_hugetlb_page(tmp))
-			reset_vma_resv_huge_pages(tmp);
-
-		/*
-		 * Link in the new vma and copy the page table entries.
-		 */
-		*pprev = tmp;
-		pprev = &tmp->vm_next;
-		tmp->vm_prev = prev;
-		prev = tmp;
-
-		__vma_link_rb(mm, tmp, rb_link, rb_parent);
-		rb_link = &tmp->vm_rb.rb_right;
-		rb_parent = &tmp->vm_rb;
-
-		mm->map_count++;
-		retval = copy_page_range(mm, oldmm, mpnt);
-
-		if (tmp->vm_ops && tmp->vm_ops->open)
-			tmp->vm_ops->open(tmp);
-
-		if (retval)
-			goto out;
-	}
-	/* a new mm has just been created */
-	arch_dup_mmap(oldmm, mm);
-	retval = 0;
-out:
-	up_write(&mm->mmap_sem);
-	flush_tlb_mm(oldmm);
-	up_write(&oldmm->mmap_sem);
-	uprobe_end_dup_mmap();
-	return retval;
-fail_nomem_anon_vma_fork:
-	mpol_put(vma_policy(tmp));
-fail_nomem_policy:
-	kmem_cache_free(vm_area_cachep, tmp);
-fail_nomem:
-	retval = -ENOMEM;
-	vm_unacct_memory(charge);
-	goto out;
-}
-
-static inline int mm_alloc_pgd(struct mm_struct *mm)
-{
-	mm->pgd = pgd_alloc(mm);
-	if (unlikely(!mm->pgd))
-		return -ENOMEM;
-	return 0;
-}
-
-static inline void mm_free_pgd(struct mm_struct *mm)
-{
-	pgd_free(mm, mm->pgd);
-}
-#else
-#define dup_mmap(mm, oldmm)	(0)
-#define mm_alloc_pgd(mm)	(0)
-#define mm_free_pgd(mm)
-#endif /* CONFIG_MMU */
-
-__cacheline_aligned_in_smp DEFINE_SPINLOCK(mmlist_lock);
-
-#define allocate_mm()	(kmem_cache_alloc(mm_cachep, GFP_KERNEL))
-#define free_mm(mm)	(kmem_cache_free(mm_cachep, (mm)))
-
-static unsigned long default_dump_filter = MMF_DUMP_FILTER_DEFAULT;
-
-static int __init coredump_filter_setup(char *s)
-{
-	default_dump_filter =
-		(simple_strtoul(s, NULL, 0) << MMF_DUMP_FILTER_SHIFT) &
-		MMF_DUMP_FILTER_MASK;
-	return 1;
-}
-
-__setup("coredump_filter=", coredump_filter_setup);
-
-#include <linux/init_task.h>
-
-static void mm_init_aio(struct mm_struct *mm)
-{
-#ifdef CONFIG_AIO
-	spin_lock_init(&mm->ioctx_lock);
-	mm->ioctx_table = NULL;
-#endif
-}
-
-static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
-{
-	atomic_set(&mm->mm_users, 1);
-	atomic_set(&mm->mm_count, 1);
-	init_rwsem(&mm->mmap_sem);
-	INIT_LIST_HEAD(&mm->mmlist);
-	mm->flags = (current->mm) ?
-		(current->mm->flags & MMF_INIT_MASK) : default_dump_filter;
-	mm->core_state = NULL;
-	atomic_long_set(&mm->nr_ptes, 0);
-	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
-	spin_lock_init(&mm->page_table_lock);
-	mm_init_aio(mm);
-	mm_init_owner(mm, p);
-	clear_tlb_flush_pending(mm);
-
-	if (likely(!mm_alloc_pgd(mm))) {
-		mm->def_flags = 0;
-		mmu_notifier_mm_init(mm);
-		return mm;
-	}
-
-	free_mm(mm);
-	return NULL;
-}
-
-static void check_mm(struct mm_struct *mm)
-{
-	int i;
-
-	for (i = 0; i < NR_MM_COUNTERS; i++) {
-		long x = atomic_long_read(&mm->rss_stat.count[i]);
-
-		if (unlikely(x))
-			printk(KERN_ALERT "BUG: Bad rss-counter state "
-					  "mm:%p idx:%d val:%ld\n", mm, i, x);
-	}
-
-#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
-	VM_BUG_ON(mm->pmd_huge_pte);
-#endif
-}
-
-/*
- * Allocate and initialize an mm_struct.
- */
-struct mm_struct *mm_alloc(void)
-{
-	struct mm_struct *mm;
-
-	mm = allocate_mm();
-	if (!mm)
-		return NULL;
-
-	memset(mm, 0, sizeof(*mm));
-	mm_init_cpumask(mm);
-	return mm_init(mm, current);
-}
-
-/*
- * Called when the last reference to the mm
- * is dropped: either by a lazy thread or by
- * mmput. Free the page directory and the mm.
- */
-void __mmdrop(struct mm_struct *mm)
-{
-	BUG_ON(mm == &init_mm);
-	mm_free_pgd(mm);
-	destroy_context(mm);
-	mmu_notifier_mm_destroy(mm);
-	check_mm(mm);
-	free_mm(mm);
-}
-EXPORT_SYMBOL_GPL(__mmdrop);
-
-/*
- * Decrement the use count and release all resources for an mm.
- */
-void mmput(struct mm_struct *mm)
-{
-	might_sleep();
-
-	if (atomic_dec_and_test(&mm->mm_users)) {
-		uprobe_clear_state(mm);
-		exit_aio(mm);
-		ksm_exit(mm);
-		khugepaged_exit(mm); /* must run before exit_mmap */
-		exit_mmap(mm);
-		set_mm_exe_file(mm, NULL);
-		if (!list_empty(&mm->mmlist)) {
-			spin_lock(&mmlist_lock);
-			list_del(&mm->mmlist);
-			spin_unlock(&mmlist_lock);
-		}
-		if (mm->binfmt)
-			module_put(mm->binfmt->module);
-		mmdrop(mm);
-	}
-}
-EXPORT_SYMBOL_GPL(mmput);
-
-void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)
-{
-	if (new_exe_file)
-		get_file(new_exe_file);
-	if (mm->exe_file)
-		fput(mm->exe_file);
-	mm->exe_file = new_exe_file;
-}
-
-struct file *get_mm_exe_file(struct mm_struct *mm)
-{
-	struct file *exe_file;
-
-	/* We need mmap_sem to protect against races with removal of exe_file */
-	down_read(&mm->mmap_sem);
-	exe_file = mm->exe_file;
-	if (exe_file)
-		get_file(exe_file);
-	up_read(&mm->mmap_sem);
-	return exe_file;
-}
-
-static void dup_mm_exe_file(struct mm_struct *oldmm, struct mm_struct *newmm)
-{
-	/* It's safe to write the exe_file pointer without exe_file_lock because
-	 * this is called during fork when the task is not yet in /proc */
-	newmm->exe_file = get_mm_exe_file(oldmm);
-}
-
-/**
- * get_task_mm - acquire a reference to the task's mm
- *
- * Returns %NULL if the task has no mm.  Checks PF_KTHREAD (meaning
- * this kernel workthread has transiently adopted a user mm with use_mm,
- * to do its AIO) is not set and if so returns a reference to it, after
- * bumping up the use count.  User must release the mm via mmput()
- * after use.  Typically used by /proc and ptrace.
- */
-struct mm_struct *get_task_mm(struct task_struct *task)
-{
-	struct mm_struct *mm;
-
-	task_lock(task);
-	mm = task->mm;
-	if (mm) {
-		if (task->flags & PF_KTHREAD)
-			mm = NULL;
-		else
-			atomic_inc(&mm->mm_users);
-	}
-	task_unlock(task);
-	return mm;
-}
-EXPORT_SYMBOL_GPL(get_task_mm);
-
-struct mm_struct *mm_access(struct task_struct *task, unsigned int mode)
-{
-	struct mm_struct *mm;
-	int err;
-
-	err =  mutex_lock_killable(&task->signal->cred_guard_mutex);
-	if (err)
-		return ERR_PTR(err);
-
-	mm = get_task_mm(task);
-	if (mm && mm != current->mm &&
-			!ptrace_may_access(task, mode)) {
-		mmput(mm);
-		mm = ERR_PTR(-EACCES);
-	}
-	mutex_unlock(&task->signal->cred_guard_mutex);
-
-	return mm;
-}
-
-static void complete_vfork_done(struct task_struct *tsk)
-{
-	struct completion *vfork;
-
-	task_lock(tsk);
-	vfork = tsk->vfork_done;
-	if (likely(vfork)) {
-		tsk->vfork_done = NULL;
-		complete(vfork);
-	}
-	task_unlock(tsk);
-}
-
-static int wait_for_vfork_done(struct task_struct *child,
-				struct completion *vfork)
-{
-	int killed;
-
-	freezer_do_not_count();
-	killed = wait_for_completion_killable(vfork);
-	freezer_count();
-
-	if (killed) {
-		task_lock(child);
-		child->vfork_done = NULL;
-		task_unlock(child);
-	}
-
-	put_task_struct(child);
-	return killed;
-}
-
-/* Please note the differences between mmput and mm_release.
- * mmput is called whenever we stop holding onto a mm_struct,
- * error success whatever.
- *
- * mm_release is called after a mm_struct has been removed
- * from the current process.
- *
- * This difference is important for error handling, when we
- * only half set up a mm_struct for a new process and need to restore
- * the old one.  Because we mmput the new mm_struct before
- * restoring the old one. . .
- * Eric Biederman 10 January 1998
- */
-void mm_release(struct task_struct *tsk, struct mm_struct *mm)
-{
-	/* Get rid of any futexes when releasing the mm */
-#ifdef CONFIG_FUTEX
-	if (unlikely(tsk->robust_list)) {
-		exit_robust_list(tsk);
-		tsk->robust_list = NULL;
-	}
-#ifdef CONFIG_COMPAT
-	if (unlikely(tsk->compat_robust_list)) {
-		compat_exit_robust_list(tsk);
-		tsk->compat_robust_list = NULL;
-	}
-#endif
-	if (unlikely(!list_empty(&tsk->pi_state_list)))
-		exit_pi_state_list(tsk);
-#endif
-
-	uprobe_free_utask(tsk);
-
-	/* Get rid of any cached register state */
-	deactivate_mm(tsk, mm);
-
-	/*
-	 * If we're exiting normally, clear a user-space tid field if
-	 * requested.  We leave this alone when dying by signal, to leave
-	 * the value intact in a core dump, and to save the unnecessary
-	 * trouble, say, a killed vfork parent shouldn't touch this mm.
-	 * Userland only wants this done for a sys_exit.
-	 */
-	if (tsk->clear_child_tid) {
-		if (!(tsk->flags & PF_SIGNALED) &&
-		    atomic_read(&mm->mm_users) > 1) {
-			/*
-			 * We don't check the error code - if userspace has
-			 * not set up a proper pointer then tough luck.
-			 */
-			put_user(0, tsk->clear_child_tid);
-			sys_futex(tsk->clear_child_tid, FUTEX_WAKE,
-					1, NULL, NULL, 0);
-		}
-		tsk->clear_child_tid = NULL;
-	}
-
-	/*
-	 * All done, finally we can wake up parent and return this mm to him.
-	 * Also kthread_stop() uses this completion for synchronization.
-	 */
-	if (tsk->vfork_done)
-		complete_vfork_done(tsk);
-}
-
-/*
- * Allocate a new mm structure and copy contents from the
- * mm structure of the passed in task structure.
- */
-static struct mm_struct *dup_mm(struct task_struct *tsk)
-{
-	struct mm_struct *mm, *oldmm = current->mm;
-	int err;
-
-	mm = allocate_mm();
-	if (!mm)
-		goto fail_nomem;
-
-	memcpy(mm, oldmm, sizeof(*mm));
-	mm_init_cpumask(mm);
-
-#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
-	mm->pmd_huge_pte = NULL;
-#endif
-	if (!mm_init(mm, tsk))
-		goto fail_nomem;
-
-	if (init_new_context(tsk, mm))
-		goto fail_nocontext;
-
-	dup_mm_exe_file(oldmm, mm);
-
-	err = dup_mmap(mm, oldmm);
-	if (err)
-		goto free_pt;
-
-	mm->hiwater_rss = get_mm_rss(mm);
-	mm->hiwater_vm = mm->total_vm;
-
-	if (mm->binfmt && !try_module_get(mm->binfmt->module))
-		goto free_pt;
-
-	return mm;
-
-free_pt:
-	/* don't put binfmt in mmput, we haven't got module yet */
-	mm->binfmt = NULL;
-	mmput(mm);
-
-fail_nomem:
-	return NULL;
-
-fail_nocontext:
-	/*
-	 * If init_new_context() failed, we cannot use mmput() to free the mm
-	 * because it calls destroy_context()
-	 */
-	mm_free_pgd(mm);
-	free_mm(mm);
-	return NULL;
-}
-
-static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
-{
-	struct mm_struct *mm, *oldmm;
-	int retval;
-
-	tsk->min_flt = tsk->maj_flt = 0;
-	tsk->nvcsw = tsk->nivcsw = 0;
-#ifdef CONFIG_DETECT_HUNG_TASK
-	tsk->last_switch_count = tsk->nvcsw + tsk->nivcsw;
-#endif
-
-	tsk->mm = NULL;
-	tsk->active_mm = NULL;
-
-	/*
-	 * Are we cloning a kernel thread?
-	 *
-	 * We need to steal a active VM for that..
-	 */
-	oldmm = current->mm;
-	if (!oldmm)
-		return 0;
-
-	if (clone_flags & CLONE_VM) {
-		atomic_inc(&oldmm->mm_users);
-		mm = oldmm;
-		goto good_mm;
-	}
-
-	retval = -ENOMEM;
-	mm = dup_mm(tsk);
-	if (!mm)
-		goto fail_nomem;
-
-good_mm:
-	tsk->mm = mm;
-	tsk->active_mm = mm;
-	return 0;
-
-fail_nomem:
-	return retval;
-}
-
-static int copy_fs(unsigned long clone_flags, struct task_struct *tsk)
-{
-	struct fs_struct *fs = current->fs;
-	if (clone_flags & CLONE_FS) {
-		/* tsk->fs is already what we want */
-		spin_lock(&fs->lock);
-		if (fs->in_exec) {
-			spin_unlock(&fs->lock);
-			return -EAGAIN;
-		}
-		fs->users++;
-		spin_unlock(&fs->lock);
-		return 0;
-	}
-	tsk->fs = copy_fs_struct(fs);
-	if (!tsk->fs)
-		return -ENOMEM;
-	return 0;
-}
-
-static int copy_files(unsigned long clone_flags, struct task_struct *tsk)
-{
-	struct files_struct *oldf, *newf;
-	int error = 0;
-
-	/*
-	 * A background process may not have any files ...
-	 */
-	oldf = current->files;
-	if (!oldf)
-		goto out;
-
-	if (clone_flags & CLONE_FILES) {
-		atomic_inc(&oldf->count);
-		goto out;
-	}
-
-	newf = dup_fd(oldf, &error);
-	if (!newf)
-		goto out;
-
-	tsk->files = newf;
-	error = 0;
-out:
-	return error;
-}
-
-static int copy_io(unsigned long clone_flags, struct task_struct *tsk)
-{
-#ifdef CONFIG_BLOCK
-	struct io_context *ioc = current->io_context;
-	struct io_context *new_ioc;
-
-	if (!ioc)
-		return 0;
-	/*
-	 * Share io context with parent, if CLONE_IO is set
-	 */
-	if (clone_flags & CLONE_IO) {
-		ioc_task_link(ioc);
-		tsk->io_context = ioc;
-	} else if (ioprio_valid(ioc->ioprio)) {
-		new_ioc = get_task_io_context(tsk, GFP_KERNEL, NUMA_NO_NODE);
-		if (unlikely(!new_ioc))
-			return -ENOMEM;
-
-		new_ioc->ioprio = ioc->ioprio;
-		put_io_context(new_ioc);
-	}
-#endif
-	return 0;
-}
-
-static int copy_sighand(unsigned long clone_flags, struct task_struct *tsk)
-{
-	struct sighand_struct *sig;
-
-	if (clone_flags & CLONE_SIGHAND) {
-		atomic_inc(&current->sighand->count);
-		return 0;
-	}
-	sig = kmem_cache_alloc(sighand_cachep, GFP_KERNEL);
-	rcu_assign_pointer(tsk->sighand, sig);
-	if (!sig)
-		return -ENOMEM;
-	atomic_set(&sig->count, 1);
-	memcpy(sig->action, current->sighand->action, sizeof(sig->action));
-	return 0;
-}
-
-void __cleanup_sighand(struct sighand_struct *sighand)
-{
-	if (atomic_dec_and_test(&sighand->count)) {
-		signalfd_cleanup(sighand);
-		kmem_cache_free(sighand_cachep, sighand);
-	}
-}
-
-
-/*
- * Initialize POSIX timer handling for a thread group.
- */
-static void posix_cpu_timers_init_group(struct signal_struct *sig)
-{
-	unsigned long cpu_limit;
-
-	/* Thread group counters. */
-	thread_group_cputime_init(sig);
-
-	cpu_limit = ACCESS_ONCE(sig->rlim[RLIMIT_CPU].rlim_cur);
-	if (cpu_limit != RLIM_INFINITY) {
-		sig->cputime_expires.prof_exp = secs_to_cputime(cpu_limit);
-		sig->cputimer.running = 1;
-	}
-
-	/* The timer lists. */
-	INIT_LIST_HEAD(&sig->cpu_timers[0]);
-	INIT_LIST_HEAD(&sig->cpu_timers[1]);
-	INIT_LIST_HEAD(&sig->cpu_timers[2]);
-}
-
-static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
-{
-	struct signal_struct *sig;
-
-	if (clone_flags & CLONE_THREAD)
-		return 0;
-
-	sig = kmem_cache_zalloc(signal_cachep, GFP_KERNEL);
-	tsk->signal = sig;
-	if (!sig)
-		return -ENOMEM;
-
-	sig->nr_threads = 1;
-	atomic_set(&sig->live, 1);
-	atomic_set(&sig->sigcnt, 1);
-
-	/* list_add(thread_node, thread_head) without INIT_LIST_HEAD() */
-	sig->thread_head = (struct list_head)LIST_HEAD_INIT(tsk->thread_node);
-	tsk->thread_node = (struct list_head)LIST_HEAD_INIT(sig->thread_head);
-
-	init_waitqueue_head(&sig->wait_chldexit);
-	sig->curr_target = tsk;
-	init_sigpending(&sig->shared_pending);
-	INIT_LIST_HEAD(&sig->posix_timers);
-
-	hrtimer_init(&sig->real_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	sig->real_timer.function = it_real_fn;
-
-	task_lock(current->group_leader);
-	memcpy(sig->rlim, current->signal->rlim, sizeof sig->rlim);
-	task_unlock(current->group_leader);
-
-	posix_cpu_timers_init_group(sig);
-
-	tty_audit_fork(sig);
-	sched_autogroup_fork(sig);
-
-#ifdef CONFIG_CGROUPS
-	init_rwsem(&sig->group_rwsem);
-#endif
-
-	sig->oom_score_adj = current->signal->oom_score_adj;
-	sig->oom_score_adj_min = current->signal->oom_score_adj_min;
-
-	sig->has_child_subreaper = current->signal->has_child_subreaper ||
-				   current->signal->is_child_subreaper;
-
-	mutex_init(&sig->cred_guard_mutex);
-
-	return 0;
-}
-
-static void copy_flags(unsigned long clone_flags, struct task_struct *p)
-{
-	unsigned long new_flags = p->flags;
-
-	new_flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER);
-	new_flags |= PF_FORKNOEXEC;
-	p->flags = new_flags;
-}
-
-SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr)
-{
-	current->clear_child_tid = tidptr;
-
-	return task_pid_vnr(current);
-}
-
-static void rt_mutex_init_task(struct task_struct *p)
-{
-	raw_spin_lock_init(&p->pi_lock);
-#ifdef CONFIG_RT_MUTEXES
-	p->pi_waiters = RB_ROOT;
-	p->pi_waiters_leftmost = NULL;
-	p->pi_blocked_on = NULL;
-	p->pi_top_task = NULL;
-#endif
-}
-
-#ifdef CONFIG_MM_OWNER
-void mm_init_owner(struct mm_struct *mm, struct task_struct *p)
-{
-	mm->owner = p;
-}
-#endif /* CONFIG_MM_OWNER */
-
-/*
- * Initialize POSIX timer handling for a single task.
- */
-static void posix_cpu_timers_init(struct task_struct *tsk)
-{
-	tsk->cputime_expires.prof_exp = 0;
-	tsk->cputime_expires.virt_exp = 0;
-	tsk->cputime_expires.sched_exp = 0;
-	INIT_LIST_HEAD(&tsk->cpu_timers[0]);
-	INIT_LIST_HEAD(&tsk->cpu_timers[1]);
-	INIT_LIST_HEAD(&tsk->cpu_timers[2]);
-}
-
-static inline void
-init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)
-{
-	 task->pids[type].pid = pid;
-}
-
-/*
- * This creates a new process as a copy of the old one,
- * but does not actually start it yet.
- *
- * It copies the registers, and all the appropriate
- * parts of the process environment (as per the clone
- * flags). The actual kick-off is left to the caller.
- */
-static struct task_struct *copy_process(unsigned long clone_flags,
-					unsigned long stack_start,
-					unsigned long stack_size,
-					int __user *child_tidptr,
-					struct pid *pid,
-					int trace)
-{
-	int retval;
-	struct task_struct *p;
-
-	if ((clone_flags & (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))
-		return ERR_PTR(-EINVAL);
-
-	if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
-		return ERR_PTR(-EINVAL);
-
-	/*
-	 * Thread groups must share signals as well, and detached threads
-	 * can only be started up within the thread group.
-	 */
-	if ((clone_flags & CLONE_THREAD) && !(clone_flags & CLONE_SIGHAND))
-		return ERR_PTR(-EINVAL);
-
-	/*
-	 * Shared signal handlers imply shared VM. By way of the above,
-	 * thread groups also imply shared VM. Blocking this case allows
-	 * for various simplifications in other code.
-	 */
-	if ((clone_flags & CLONE_SIGHAND) && !(clone_flags & CLONE_VM))
-		return ERR_PTR(-EINVAL);
-
-	/*
-	 * Siblings of global init remain as zombies on exit since they are
-	 * not reaped by their parent (swapper). To solve this and to avoid
-	 * multi-rooted process trees, prevent global and container-inits
-	 * from creating siblings.
-	 */
-	if ((clone_flags & CLONE_PARENT) &&
-				current->signal->flags & SIGNAL_UNKILLABLE)
-		return ERR_PTR(-EINVAL);
-
-	/*
-	 * If the new process will be in a different pid or user namespace
-	 * do not allow it to share a thread group or signal handlers or
-	 * parent with the forking task.
-	 */
-	if (clone_flags & CLONE_SIGHAND) {
-		if ((clone_flags & (CLONE_NEWUSER | CLONE_NEWPID)) ||
-		    (task_active_pid_ns(current) !=
-				current->nsproxy->pid_ns_for_children))
-			return ERR_PTR(-EINVAL);
-	}
-
-	retval = security_task_create(clone_flags);
-	if (retval)
-		goto fork_out;
-
-	retval = -ENOMEM;
-	p = dup_task_struct(current);
-	if (!p)
-		goto fork_out;
-
-	ftrace_graph_init_task(p);
-	get_seccomp_filter(p);
-
-	rt_mutex_init_task(p);
-
-#ifdef CONFIG_PROVE_LOCKING
-	DEBUG_LOCKS_WARN_ON(!p->hardirqs_enabled);
-	DEBUG_LOCKS_WARN_ON(!p->softirqs_enabled);
-#endif
-	retval = -EAGAIN;
-	if (atomic_read(&p->real_cred->user->processes) >=
-			task_rlimit(p, RLIMIT_NPROC)) {
-		if (p->real_cred->user != INIT_USER &&
-		    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))
-			goto bad_fork_free;
-	}
-	current->flags &= ~PF_NPROC_EXCEEDED;
-
-	retval = copy_creds(p, clone_flags);
-	if (retval < 0)
-		goto bad_fork_free;
-
-	/*
-	 * If multiple threads are within copy_process(), then this check
-	 * triggers too late. This doesn't hurt, the check is only there
-	 * to stop root fork bombs.
-	 */
-	retval = -EAGAIN;
-	if (nr_threads >= max_threads)
-		goto bad_fork_cleanup_count;
-
-	if (!try_module_get(task_thread_info(p)->exec_domain->module))
-		goto bad_fork_cleanup_count;
-
-	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
-	copy_flags(clone_flags, p);
-	INIT_LIST_HEAD(&p->children);
-	INIT_LIST_HEAD(&p->sibling);
-	rcu_copy_process(p);
-	p->vfork_done = NULL;
-	spin_lock_init(&p->alloc_lock);
-
-	init_sigpending(&p->pending);
-
-	p->utime = p->stime = p->gtime = 0;
-	p->utimescaled = p->stimescaled = 0;
-#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-	p->prev_cputime.utime = p->prev_cputime.stime = 0;
-#endif
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
-	seqlock_init(&p->vtime_seqlock);
-	p->vtime_snap = 0;
-	p->vtime_snap_whence = VTIME_SLEEPING;
-#endif
-
-#if defined(SPLIT_RSS_COUNTING)
-	memset(&p->rss_stat, 0, sizeof(p->rss_stat));
-#endif
-
-	p->default_timer_slack_ns = current->timer_slack_ns;
-
-	task_io_accounting_init(&p->ioac);
-	acct_clear_integrals(p);
-
-	posix_cpu_timers_init(p);
-
-	do_posix_clock_monotonic_gettime(&p->start_time);
-	p->real_start_time = p->start_time;
-	monotonic_to_bootbased(&p->real_start_time);
-	p->io_context = NULL;
-	p->audit_context = NULL;
-	if (clone_flags & CLONE_THREAD)
-		threadgroup_change_begin(current);
-	cgroup_fork(p);
-#ifdef CONFIG_NUMA
-	p->mempolicy = mpol_dup(p->mempolicy);
-	if (IS_ERR(p->mempolicy)) {
-		retval = PTR_ERR(p->mempolicy);
-		p->mempolicy = NULL;
-		goto bad_fork_cleanup_cgroup;
-	}
-	mpol_fix_fork_child_flag(p);
-#endif
-#ifdef CONFIG_CPUSETS
-	p->cpuset_mem_spread_rotor = NUMA_NO_NODE;
-	p->cpuset_slab_spread_rotor = NUMA_NO_NODE;
-	seqcount_init(&p->mems_allowed_seq);
-#endif
-#ifdef CONFIG_TRACE_IRQFLAGS
-	p->irq_events = 0;
-	p->hardirqs_enabled = 0;
-	p->hardirq_enable_ip = 0;
-	p->hardirq_enable_event = 0;
-	p->hardirq_disable_ip = _THIS_IP_;
-	p->hardirq_disable_event = 0;
-	p->softirqs_enabled = 1;
-	p->softirq_enable_ip = _THIS_IP_;
-	p->softirq_enable_event = 0;
-	p->softirq_disable_ip = 0;
-	p->softirq_disable_event = 0;
-	p->hardirq_context = 0;
-	p->softirq_context = 0;
-#endif
-#ifdef CONFIG_LOCKDEP
-	p->lockdep_depth = 0; /* no locks held yet */
-	p->curr_chain_key = 0;
-	p->lockdep_recursion = 0;
-#endif
-
-#ifdef CONFIG_DEBUG_MUTEXES
-	p->blocked_on = NULL; /* not blocked yet */
-#endif
-#ifdef CONFIG_MEMCG
-	p->memcg_batch.do_batch = 0;
-	p->memcg_batch.memcg = NULL;
-#endif
-#ifdef CONFIG_BCACHE
-	p->sequential_io	= 0;
-	p->sequential_io_avg	= 0;
-#endif
-
-	/* Perform scheduler related setup. Assign this task to a CPU. */
-	retval = sched_fork(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_policy;
-
-	retval = perf_event_init_task(p);
-	if (retval)
-		goto bad_fork_cleanup_policy;
-	retval = audit_alloc(p);
-	if (retval)
-		goto bad_fork_cleanup_policy;
-	/* copy all the process information */
-	retval = copy_semundo(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_audit;
-	retval = copy_files(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_semundo;
-	retval = copy_fs(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_files;
-	retval = copy_sighand(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_fs;
-	retval = copy_signal(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_sighand;
-	retval = copy_mm(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_signal;
-	retval = copy_namespaces(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_mm;
-	retval = copy_io(clone_flags, p);
-	if (retval)
-		goto bad_fork_cleanup_namespaces;
-	retval = copy_thread(clone_flags, stack_start, stack_size, p);
-	if (retval)
-		goto bad_fork_cleanup_io;
-
-	if (pid != &init_struct_pid) {
-		retval = -ENOMEM;
-		pid = alloc_pid(p->nsproxy->pid_ns_for_children);
-		if (!pid)
-			goto bad_fork_cleanup_io;
-	}
-
-	p->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;
-	/*
-	 * Clear TID on mm_release()?
-	 */
-	p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;
-#ifdef CONFIG_BLOCK
-	p->plug = NULL;
-#endif
-#ifdef CONFIG_FUTEX
-	p->robust_list = NULL;
-#ifdef CONFIG_COMPAT
-	p->compat_robust_list = NULL;
-#endif
-	INIT_LIST_HEAD(&p->pi_state_list);
-	p->pi_state_cache = NULL;
-#endif
-	/*
-	 * sigaltstack should be cleared when sharing the same VM
-	 */
-	if ((clone_flags & (CLONE_VM|CLONE_VFORK)) == CLONE_VM)
-		p->sas_ss_sp = p->sas_ss_size = 0;
-
-	/*
-	 * Syscall tracing and stepping should be turned off in the
-	 * child regardless of CLONE_PTRACE.
-	 */
-	user_disable_single_step(p);
-	clear_tsk_thread_flag(p, TIF_SYSCALL_TRACE);
-#ifdef TIF_SYSCALL_EMU
-	clear_tsk_thread_flag(p, TIF_SYSCALL_EMU);
-#endif
-	clear_all_latency_tracing(p);
-
-	/* ok, now we should be set up.. */
-	p->pid = pid_nr(pid);
-	if (clone_flags & CLONE_THREAD) {
-		p->exit_signal = -1;
-		p->group_leader = current->group_leader;
-		p->tgid = current->tgid;
-	} else {
-		if (clone_flags & CLONE_PARENT)
-			p->exit_signal = current->group_leader->exit_signal;
-		else
-			p->exit_signal = (clone_flags & CSIGNAL);
-		p->group_leader = p;
-		p->tgid = p->pid;
-	}
-
-	p->nr_dirtied = 0;
-	p->nr_dirtied_pause = 128 >> (PAGE_SHIFT - 10);
-	p->dirty_paused_when = 0;
-
-	p->pdeath_signal = 0;
-	INIT_LIST_HEAD(&p->thread_group);
-	p->task_works = NULL;
-
-	/*
-	 * Make it visible to the rest of the system, but dont wake it up yet.
-	 * Need tasklist lock for parent etc handling!
-	 */
-	write_lock_irq(&tasklist_lock);
-
-	/* CLONE_PARENT re-uses the old parent */
-	if (clone_flags & (CLONE_PARENT|CLONE_THREAD)) {
-		p->real_parent = current->real_parent;
-		p->parent_exec_id = current->parent_exec_id;
-	} else {
-		p->real_parent = current;
-		p->parent_exec_id = current->self_exec_id;
-	}
-
-	spin_lock(&current->sighand->siglock);
-
-	/*
-	 * Process group and session signals need to be delivered to just the
-	 * parent before the fork or both the parent and the child after the
-	 * fork. Restart if a signal comes in before we add the new process to
-	 * it's process group.
-	 * A fatal signal pending means that current will exit, so the new
-	 * thread can't slip out of an OOM kill (or normal SIGKILL).
-	*/
-	recalc_sigpending();
-	if (signal_pending(current)) {
-		spin_unlock(&current->sighand->siglock);
-		write_unlock_irq(&tasklist_lock);
-		retval = -ERESTARTNOINTR;
-		goto bad_fork_free_pid;
-	}
-
-	if (likely(p->pid)) {
-		ptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);
-
-		init_task_pid(p, PIDTYPE_PID, pid);
-		if (thread_group_leader(p)) {
-			init_task_pid(p, PIDTYPE_PGID, task_pgrp(current));
-			init_task_pid(p, PIDTYPE_SID, task_session(current));
-
-			if (is_child_reaper(pid)) {
-				ns_of_pid(pid)->child_reaper = p;
-				p->signal->flags |= SIGNAL_UNKILLABLE;
-			}
-
-			p->signal->leader_pid = pid;
-			p->signal->tty = tty_kref_get(current->signal->tty);
-			list_add_tail(&p->sibling, &p->real_parent->children);
-			list_add_tail_rcu(&p->tasks, &init_task.tasks);
-			attach_pid(p, PIDTYPE_PGID);
-			attach_pid(p, PIDTYPE_SID);
-			__this_cpu_inc(process_counts);
-		} else {
-			current->signal->nr_threads++;
-			atomic_inc(&current->signal->live);
-			atomic_inc(&current->signal->sigcnt);
-			list_add_tail_rcu(&p->thread_group,
-					  &p->group_leader->thread_group);
-			list_add_tail_rcu(&p->thread_node,
-					  &p->signal->thread_head);
-		}
-		attach_pid(p, PIDTYPE_PID);
-		nr_threads++;
-	}
-
-	total_forks++;
-	spin_unlock(&current->sighand->siglock);
-	write_unlock_irq(&tasklist_lock);
-	proc_fork_connector(p);
-	cgroup_post_fork(p);
-	if (clone_flags & CLONE_THREAD)
-		threadgroup_change_end(current);
-	perf_event_fork(p);
-
-	trace_task_newtask(p, clone_flags);
-	uprobe_copy_process(p, clone_flags);
-
-	return p;
-
-bad_fork_free_pid:
-	if (pid != &init_struct_pid)
-		free_pid(pid);
-bad_fork_cleanup_io:
-	if (p->io_context)
-		exit_io_context(p);
-bad_fork_cleanup_namespaces:
-	exit_task_namespaces(p);
-bad_fork_cleanup_mm:
-	if (p->mm)
-		mmput(p->mm);
-bad_fork_cleanup_signal:
-	if (!(clone_flags & CLONE_THREAD))
-		free_signal_struct(p->signal);
-bad_fork_cleanup_sighand:
-	__cleanup_sighand(p->sighand);
-bad_fork_cleanup_fs:
-	exit_fs(p); /* blocking */
-bad_fork_cleanup_files:
-	exit_files(p); /* blocking */
-bad_fork_cleanup_semundo:
-	exit_sem(p);
-bad_fork_cleanup_audit:
-	audit_free(p);
-bad_fork_cleanup_policy:
-	perf_event_free_task(p);
-#ifdef CONFIG_NUMA
-	mpol_put(p->mempolicy);
-bad_fork_cleanup_cgroup:
-#endif
-	if (clone_flags & CLONE_THREAD)
-		threadgroup_change_end(current);
-	cgroup_exit(p, 0);
-	delayacct_tsk_free(p);
-	module_put(task_thread_info(p)->exec_domain->module);
-bad_fork_cleanup_count:
-	atomic_dec(&p->cred->user->processes);
-	exit_creds(p);
-bad_fork_free:
-	free_task(p);
-fork_out:
-	return ERR_PTR(retval);
-}
-
-static inline void init_idle_pids(struct pid_link *links)
-{
-	enum pid_type type;
-
-	for (type = PIDTYPE_PID; type < PIDTYPE_MAX; ++type) {
-		INIT_HLIST_NODE(&links[type].node); /* not really needed */
-		links[type].pid = &init_struct_pid;
-	}
-}
-
-struct task_struct *fork_idle(int cpu)
-{
-	struct task_struct *task;
-	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0);
-	if (!IS_ERR(task)) {
-		init_idle_pids(task->pids);
-		init_idle(task, cpu);
-	}
-
-	return task;
-}
-
-/*
- *  Ok, this is the main fork-routine.
- *
- * It copies the process, and if successful kick-starts
- * it and waits for it to finish using the VM if required.
- */
-long do_fork(unsigned long clone_flags,
-	      unsigned long stack_start,
-	      unsigned long stack_size,
-	      int __user *parent_tidptr,
-	      int __user *child_tidptr)
-{
-	struct task_struct *p;
-	int trace = 0;
-	long nr;
-
-	/*
-	 * Determine whether and which event to report to ptracer.  When
-	 * called from kernel_thread or CLONE_UNTRACED is explicitly
-	 * requested, no event is reported; otherwise, report if the event
-	 * for the type of forking is enabled.
-	 */
-	if (!(clone_flags & CLONE_UNTRACED)) {
-		if (clone_flags & CLONE_VFORK)
-			trace = PTRACE_EVENT_VFORK;
-		else if ((clone_flags & CSIGNAL) != SIGCHLD)
-			trace = PTRACE_EVENT_CLONE;
-		else
-			trace = PTRACE_EVENT_FORK;
-
-		if (likely(!ptrace_event_enabled(current, trace)))
-			trace = 0;
-	}
-
-	p = copy_process(clone_flags, stack_start, stack_size,
-			 child_tidptr, NULL, trace);
-	/*
-	 * Do this prior waking up the new thread - the thread pointer
-	 * might get invalid after that point, if the thread exits quickly.
-	 */
-	if (!IS_ERR(p)) {
-		struct completion vfork;
-
-		trace_sched_process_fork(current, p);
-
-		nr = task_pid_vnr(p);
-
-		if (clone_flags & CLONE_PARENT_SETTID)
-			put_user(nr, parent_tidptr);
-
-		if (clone_flags & CLONE_VFORK) {
-			p->vfork_done = &vfork;
-			init_completion(&vfork);
-			get_task_struct(p);
-		}
-
-		wake_up_new_task(p);
-
-		/* forking complete and child started to run, tell ptracer */
-		if (unlikely(trace))
-			ptrace_event(trace, nr);
-
-		if (clone_flags & CLONE_VFORK) {
-			if (!wait_for_vfork_done(p, &vfork))
-				ptrace_event(PTRACE_EVENT_VFORK_DONE, nr);
-		}
-	} else {
-		nr = PTR_ERR(p);
-	}
-	return nr;
-}
-
-/*
- * Create a kernel thread.
- */
-pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
-{
-	return do_fork(flags|CLONE_VM|CLONE_UNTRACED, (unsigned long)fn,
-		(unsigned long)arg, NULL, NULL);
-}
-
-#ifdef __ARCH_WANT_SYS_FORK
-SYSCALL_DEFINE0(fork)
-{
-#ifdef CONFIG_MMU
-	return do_fork(SIGCHLD, 0, 0, NULL, NULL);
-#else
-	/* can not support in nommu mode */
-	return -EINVAL;
-#endif
-}
-#endif
-
-#ifdef __ARCH_WANT_SYS_VFORK
-SYSCALL_DEFINE0(vfork)
-{
-	return do_fork(CLONE_VFORK | CLONE_VM | SIGCHLD, 0,
-			0, NULL, NULL);
-}
-#endif
-
-#ifdef __ARCH_WANT_SYS_CLONE
-#ifdef CONFIG_CLONE_BACKWARDS
-SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
-		 int __user *, parent_tidptr,
-		 int, tls_val,
-		 int __user *, child_tidptr)
-#elif defined(CONFIG_CLONE_BACKWARDS2)
-SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,
-		 int __user *, parent_tidptr,
-		 int __user *, child_tidptr,
-		 int, tls_val)
-#elif defined(CONFIG_CLONE_BACKWARDS3)
-SYSCALL_DEFINE6(clone, unsigned long, clone_flags, unsigned long, newsp,
-		int, stack_size,
-		int __user *, parent_tidptr,
-		int __user *, child_tidptr,
-		int, tls_val)
-#else
-SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
-		 int __user *, parent_tidptr,
-		 int __user *, child_tidptr,
-		 int, tls_val)
-#endif
-{
-	return do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr);
-}
-#endif
-
-#ifndef ARCH_MIN_MMSTRUCT_ALIGN
-#define ARCH_MIN_MMSTRUCT_ALIGN 0
-#endif
-
-static void sighand_ctor(void *data)
-{
-	struct sighand_struct *sighand = data;
-
-	spin_lock_init(&sighand->siglock);
-	init_waitqueue_head(&sighand->signalfd_wqh);
-}
-
-void __init proc_caches_init(void)
-{
-	sighand_cachep = kmem_cache_create("sighand_cache",
-			sizeof(struct sighand_struct), 0,
-			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_DESTROY_BY_RCU|
-			SLAB_NOTRACK, sighand_ctor);
-	signal_cachep = kmem_cache_create("signal_cache",
-			sizeof(struct signal_struct), 0,
-			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);
-	files_cachep = kmem_cache_create("files_cache",
-			sizeof(struct files_struct), 0,
-			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);
-	fs_cachep = kmem_cache_create("fs_cache",
-			sizeof(struct fs_struct), 0,
-			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);
-	/*
-	 * FIXME! The "sizeof(struct mm_struct)" currently includes the
-	 * whole struct cpumask for the OFFSTACK case. We could change
-	 * this to *only* allocate as much of it as required by the
-	 * maximum number of CPU's we can ever have.  The cpumask_allocation
-	 * is at the end of the structure, exactly for that reason.
-	 */
-	mm_cachep = kmem_cache_create("mm_struct",
-			sizeof(struct mm_struct), ARCH_MIN_MMSTRUCT_ALIGN,
-			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);
-	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC);
-	mmap_init();
-	nsproxy_cache_init();
-}
-
-/*
- * Check constraints on flags passed to the unshare system call.
- */
-static int check_unshare_flags(unsigned long unshare_flags)
-{
-	if (unshare_flags & ~(CLONE_THREAD|CLONE_FS|CLONE_NEWNS|CLONE_SIGHAND|
-				CLONE_VM|CLONE_FILES|CLONE_SYSVSEM|
-				CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWNET|
-				CLONE_NEWUSER|CLONE_NEWPID))
-		return -EINVAL;
-	/*
-	 * Not implemented, but pretend it works if there is nothing to
-	 * unshare. Note that unsharing CLONE_THREAD or CLONE_SIGHAND
-	 * needs to unshare vm.
-	 */
-	if (unshare_flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM)) {
-		/* FIXME: get_task_mm() increments ->mm_users */
-		if (atomic_read(&current->mm->mm_users) > 1)
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
-/*
- * Unshare the filesystem structure if it is being shared
- */
-static int unshare_fs(unsigned long unshare_flags, struct fs_struct **new_fsp)
-{
-	struct fs_struct *fs = current->fs;
-
-	if (!(unshare_flags & CLONE_FS) || !fs)
-		return 0;
-
-	/* don't need lock here; in the worst case we'll do useless copy */
-	if (fs->users == 1)
-		return 0;
-
-	*new_fsp = copy_fs_struct(fs);
-	if (!*new_fsp)
-		return -ENOMEM;
-
-	return 0;
-}
-
-/*
- * Unshare file descriptor table if it is being shared
- */
-static int unshare_fd(unsigned long unshare_flags, struct files_struct **new_fdp)
-{
-	struct files_struct *fd = current->files;
-	int error = 0;
-
-	if ((unshare_flags & CLONE_FILES) &&
-	    (fd && atomic_read(&fd->count) > 1)) {
-		*new_fdp = dup_fd(fd, &error);
-		if (!*new_fdp)
-			return error;
-	}
-
-	return 0;
-}
-
-/*
- * unshare allows a process to 'unshare' part of the process
- * context which was originally shared using clone.  copy_*
- * functions used by do_fork() cannot be used here directly
- * because they modify an inactive task_struct that is being
- * constructed. Here we are modifying the current, active,
- * task_struct.
- */
-SYSCALL_DEFINE1(unshare, unsigned long, unshare_flags)
-{
-	struct fs_struct *fs, *new_fs = NULL;
-	struct files_struct *fd, *new_fd = NULL;
-	struct cred *new_cred = NULL;
-	struct nsproxy *new_nsproxy = NULL;
-	int do_sysvsem = 0;
-	int err;
-
-	/*
-	 * If unsharing a user namespace must also unshare the thread.
-	 */
-	if (unshare_flags & CLONE_NEWUSER)
-		unshare_flags |= CLONE_THREAD | CLONE_FS;
-	/*
-	 * If unsharing a thread from a thread group, must also unshare vm.
-	 */
-	if (unshare_flags & CLONE_THREAD)
-		unshare_flags |= CLONE_VM;
-	/*
-	 * If unsharing vm, must also unshare signal handlers.
-	 */
-	if (unshare_flags & CLONE_VM)
-		unshare_flags |= CLONE_SIGHAND;
-	/*
-	 * If unsharing namespace, must also unshare filesystem information.
-	 */
-	if (unshare_flags & CLONE_NEWNS)
-		unshare_flags |= CLONE_FS;
-
-	err = check_unshare_flags(unshare_flags);
-	if (err)
-		goto bad_unshare_out;
-	/*
-	 * CLONE_NEWIPC must also detach from the undolist: after switching
-	 * to a new ipc namespace, the semaphore arrays from the old
-	 * namespace are unreachable.
-	 */
-	if (unshare_flags & (CLONE_NEWIPC|CLONE_SYSVSEM))
-		do_sysvsem = 1;
-	err = unshare_fs(unshare_flags, &new_fs);
-	if (err)
-		goto bad_unshare_out;
-	err = unshare_fd(unshare_flags, &new_fd);
-	if (err)
-		goto bad_unshare_cleanup_fs;
-	err = unshare_userns(unshare_flags, &new_cred);
-	if (err)
-		goto bad_unshare_cleanup_fd;
-	err = unshare_nsproxy_namespaces(unshare_flags, &new_nsproxy,
-					 new_cred, new_fs);
-	if (err)
-		goto bad_unshare_cleanup_cred;
-
-	if (new_fs || new_fd || do_sysvsem || new_cred || new_nsproxy) {
-		if (do_sysvsem) {
-			/*
-			 * CLONE_SYSVSEM is equivalent to sys_exit().
-			 */
-			exit_sem(current);
-		}
-
-		if (new_nsproxy)
-			switch_task_namespaces(current, new_nsproxy);
-
-		task_lock(current);
-
-		if (new_fs) {
-			fs = current->fs;
-			spin_lock(&fs->lock);
-			current->fs = new_fs;
-			if (--fs->users)
-				new_fs = NULL;
-			else
-				new_fs = fs;
-			spin_unlock(&fs->lock);
-		}
-
-		if (new_fd) {
-			fd = current->files;
-			current->files = new_fd;
-			new_fd = fd;
-		}
-
-		task_unlock(current);
-
-		if (new_cred) {
-			/* Install the new user namespace */
-			commit_creds(new_cred);
-			new_cred = NULL;
-		}
-	}
-
-bad_unshare_cleanup_cred:
-	if (new_cred)
-		put_cred(new_cred);
-bad_unshare_cleanup_fd:
-	if (new_fd)
-		put_files_struct(new_fd);
-
-bad_unshare_cleanup_fs:
-	if (new_fs)
-		free_fs_struct(new_fs);
-
-bad_unshare_out:
-	return err;
-}
-
-/*
- *	Helper to unshare the files of the current task.
- *	We don't want to expose copy_files internals to
- *	the exec layer of the kernel.
- */
-
-int unshare_files(struct files_struct **displaced)
-{
-	struct task_struct *task = current;
-	struct files_struct *copy = NULL;
-	int error;
-
-	error = unshare_fd(CLONE_FILES, &copy);
-	if (error || !copy) {
-		*displaced = NULL;
-		return error;
-	}
-	*displaced = task->files;
-	task_lock(task);
-	task->files = copy;
-	task_unlock(task);
-	return 0;
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ *  linux/kernel/fork.c	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ *  Copyright (C) 1991, 1992  Linus Torvalds	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ *  'fork.c' contains the help-routines for the 'fork' system call	err = gpiochip_add(&port->bgc.gc);
+ * (see also entry.S and others).	err = gpiochip_add(&port->bgc.gc);
+ * Fork is rather simple, once you get the hang of it, but the memory	err = gpiochip_add(&port->bgc.gc);
+ * management can be a bitch. See 'mm/memory.c': 'copy_page_range()'	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#include <linux/slab.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/init.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/unistd.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/module.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/vmalloc.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/completion.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/personality.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/mempolicy.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/sem.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/file.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/fdtable.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/iocontext.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/key.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/binfmts.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/mman.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/mmu_notifier.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/fs.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/nsproxy.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/capability.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/cpu.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/cgroup.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/security.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/hugetlb.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/seccomp.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/swap.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/syscalls.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/jiffies.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/futex.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/compat.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/kthread.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/task_io_accounting_ops.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/rcupdate.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/ptrace.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/mount.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/audit.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/memcontrol.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/ftrace.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/proc_fs.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/profile.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/rmap.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/ksm.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/acct.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/tsacct_kern.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/cn_proc.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/freezer.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/delayacct.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/taskstats_kern.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/random.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/tty.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/blkdev.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/fs_struct.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/magic.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/perf_event.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/posix-timers.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/user-return-notifier.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/oom.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/khugepaged.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/signalfd.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/uprobes.h>	err = gpiochip_add(&port->bgc.gc);
+#include <linux/aio.h>	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#include <asm/pgtable.h>	err = gpiochip_add(&port->bgc.gc);
+#include <asm/pgalloc.h>	err = gpiochip_add(&port->bgc.gc);
+#include <asm/uaccess.h>	err = gpiochip_add(&port->bgc.gc);
+#include <asm/mmu_context.h>	err = gpiochip_add(&port->bgc.gc);
+#include <asm/cacheflush.h>	err = gpiochip_add(&port->bgc.gc);
+#include <asm/tlbflush.h>	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#include <trace/events/sched.h>	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#define CREATE_TRACE_POINTS	err = gpiochip_add(&port->bgc.gc);
+#include <trace/events/task.h>	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Protected counters by write_lock_irq(&tasklist_lock)	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+unsigned long total_forks;	/* Handle normal Linux uptimes. */	err = gpiochip_add(&port->bgc.gc);
+int nr_threads;			/* The idle threads do not count.. */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+int max_threads;		/* tunable limit on nr_threads */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+DEFINE_PER_CPU(unsigned long, process_counts) = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+__cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_PROVE_RCU	err = gpiochip_add(&port->bgc.gc);
+int lockdep_tasklist_lock_is_held(void)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return lockdep_is_held(&tasklist_lock);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL_GPL(lockdep_tasklist_lock_is_held);	err = gpiochip_add(&port->bgc.gc);
+#endif /* #ifdef CONFIG_PROVE_RCU */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+int nr_processes(void)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	int cpu;	err = gpiochip_add(&port->bgc.gc);
+	int total = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	for_each_possible_cpu(cpu)	err = gpiochip_add(&port->bgc.gc);
+		total += per_cpu(process_counts, cpu);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return total;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __weak arch_release_task_struct(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR	err = gpiochip_add(&port->bgc.gc);
+static struct kmem_cache *task_struct_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline struct task_struct *alloc_task_struct_node(int node)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return kmem_cache_alloc_node(task_struct_cachep, GFP_KERNEL, node);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void free_task_struct(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	kmem_cache_free(task_struct_cachep, tsk);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __weak arch_release_thread_info(struct thread_info *ti)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifndef CONFIG_ARCH_THREAD_INFO_ALLOCATOR	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Allocate pages if THREAD_SIZE is >= PAGE_SIZE, otherwise use a	err = gpiochip_add(&port->bgc.gc);
+ * kmemcache based allocator.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+# if THREAD_SIZE >= PAGE_SIZE	err = gpiochip_add(&port->bgc.gc);
+static struct thread_info *alloc_thread_info_node(struct task_struct *tsk,	err = gpiochip_add(&port->bgc.gc);
+						  int node)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct page *page = alloc_pages_node(node, THREADINFO_GFP_ACCOUNTED,	err = gpiochip_add(&port->bgc.gc);
+					     THREAD_SIZE_ORDER);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return page ? page_address(page) : NULL;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void free_thread_info(struct thread_info *ti)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	free_memcg_kmem_pages((unsigned long)ti, THREAD_SIZE_ORDER);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+# else	err = gpiochip_add(&port->bgc.gc);
+static struct kmem_cache *thread_info_cache;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static struct thread_info *alloc_thread_info_node(struct task_struct *tsk,	err = gpiochip_add(&port->bgc.gc);
+						  int node)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return kmem_cache_alloc_node(thread_info_cache, THREADINFO_GFP, node);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void free_thread_info(struct thread_info *ti)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	kmem_cache_free(thread_info_cache, ti);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void thread_info_cache_init(void)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	thread_info_cache = kmem_cache_create("thread_info", THREAD_SIZE,	err = gpiochip_add(&port->bgc.gc);
+					      THREAD_SIZE, 0, NULL);	err = gpiochip_add(&port->bgc.gc);
+	BUG_ON(thread_info_cache == NULL);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+# endif	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for signal_struct structures (tsk->signal) */	err = gpiochip_add(&port->bgc.gc);
+static struct kmem_cache *signal_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for sighand_struct structures (tsk->sighand) */	err = gpiochip_add(&port->bgc.gc);
+struct kmem_cache *sighand_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for files_struct structures (tsk->files) */	err = gpiochip_add(&port->bgc.gc);
+struct kmem_cache *files_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for fs_struct structures (tsk->fs) */	err = gpiochip_add(&port->bgc.gc);
+struct kmem_cache *fs_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for vm_area_struct structures */	err = gpiochip_add(&port->bgc.gc);
+struct kmem_cache *vm_area_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* SLAB cache for mm_struct structures (tsk->mm) */	err = gpiochip_add(&port->bgc.gc);
+static struct kmem_cache *mm_cachep;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void account_kernel_stack(struct thread_info *ti, int account)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct zone *zone = page_zone(virt_to_page(ti));	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mod_zone_page_state(zone, NR_KERNEL_STACK, account);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void free_task(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	account_kernel_stack(tsk->stack, -1);	err = gpiochip_add(&port->bgc.gc);
+	arch_release_thread_info(tsk->stack);	err = gpiochip_add(&port->bgc.gc);
+	free_thread_info(tsk->stack);	err = gpiochip_add(&port->bgc.gc);
+	rt_mutex_debug_task_free(tsk);	err = gpiochip_add(&port->bgc.gc);
+	ftrace_graph_exit_task(tsk);	err = gpiochip_add(&port->bgc.gc);
+	put_seccomp_filter(tsk);	err = gpiochip_add(&port->bgc.gc);
+	arch_release_task_struct(tsk);	err = gpiochip_add(&port->bgc.gc);
+	free_task_struct(tsk);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL(free_task);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void free_signal_struct(struct signal_struct *sig)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	taskstats_tgid_free(sig);	err = gpiochip_add(&port->bgc.gc);
+	sched_autogroup_exit(sig);	err = gpiochip_add(&port->bgc.gc);
+	kmem_cache_free(signal_cachep, sig);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void put_signal_struct(struct signal_struct *sig)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	if (atomic_dec_and_test(&sig->sigcnt))	err = gpiochip_add(&port->bgc.gc);
+		free_signal_struct(sig);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __put_task_struct(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	WARN_ON(!tsk->exit_state);	err = gpiochip_add(&port->bgc.gc);
+	WARN_ON(atomic_read(&tsk->usage));	err = gpiochip_add(&port->bgc.gc);
+	WARN_ON(tsk == current);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	task_numa_free(tsk);	err = gpiochip_add(&port->bgc.gc);
+	security_task_free(tsk);	err = gpiochip_add(&port->bgc.gc);
+	exit_creds(tsk);	err = gpiochip_add(&port->bgc.gc);
+	delayacct_tsk_free(tsk);	err = gpiochip_add(&port->bgc.gc);
+	put_signal_struct(tsk->signal);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (!profile_handoff_task(tsk))	err = gpiochip_add(&port->bgc.gc);
+		free_task(tsk);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL_GPL(__put_task_struct);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __init __weak arch_task_cache_init(void) { }	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __init fork_init(unsigned long mempages)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+#ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR	err = gpiochip_add(&port->bgc.gc);
+#ifndef ARCH_MIN_TASKALIGN	err = gpiochip_add(&port->bgc.gc);
+#define ARCH_MIN_TASKALIGN	L1_CACHE_BYTES	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	/* create a slab on which task_structs can be allocated */	err = gpiochip_add(&port->bgc.gc);
+	task_struct_cachep =	err = gpiochip_add(&port->bgc.gc);
+		kmem_cache_create("task_struct", sizeof(struct task_struct),	err = gpiochip_add(&port->bgc.gc);
+			ARCH_MIN_TASKALIGN, SLAB_PANIC | SLAB_NOTRACK, NULL);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* do the arch specific task caches init */	err = gpiochip_add(&port->bgc.gc);
+	arch_task_cache_init();	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * The default maximum number of threads is set to a safe	err = gpiochip_add(&port->bgc.gc);
+	 * value: the thread structures can take up at most half	err = gpiochip_add(&port->bgc.gc);
+	 * of memory.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	max_threads = mempages / (8 * THREAD_SIZE / PAGE_SIZE);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * we need to allow at least 20 threads to boot a system	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (max_threads < 20)	err = gpiochip_add(&port->bgc.gc);
+		max_threads = 20;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	init_task.signal->rlim[RLIMIT_NPROC].rlim_cur = max_threads/2;	err = gpiochip_add(&port->bgc.gc);
+	init_task.signal->rlim[RLIMIT_NPROC].rlim_max = max_threads/2;	err = gpiochip_add(&port->bgc.gc);
+	init_task.signal->rlim[RLIMIT_SIGPENDING] =	err = gpiochip_add(&port->bgc.gc);
+		init_task.signal->rlim[RLIMIT_NPROC];	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+int __attribute__((weak)) arch_dup_task_struct(struct task_struct *dst,	err = gpiochip_add(&port->bgc.gc);
+					       struct task_struct *src)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	*dst = *src;	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static struct task_struct *dup_task_struct(struct task_struct *orig)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct task_struct *tsk;	err = gpiochip_add(&port->bgc.gc);
+	struct thread_info *ti;	err = gpiochip_add(&port->bgc.gc);
+	unsigned long *stackend;	err = gpiochip_add(&port->bgc.gc);
+	int node = tsk_fork_get_node(orig);	err = gpiochip_add(&port->bgc.gc);
+	int err;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tsk = alloc_task_struct_node(node);	err = gpiochip_add(&port->bgc.gc);
+	if (!tsk)	err = gpiochip_add(&port->bgc.gc);
+		return NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	ti = alloc_thread_info_node(tsk, node);	err = gpiochip_add(&port->bgc.gc);
+	if (!ti)	err = gpiochip_add(&port->bgc.gc);
+		goto free_tsk;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	err = arch_dup_task_struct(tsk, orig);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto free_ti;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tsk->stack = ti;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	setup_thread_stack(tsk, orig);	err = gpiochip_add(&port->bgc.gc);
+	clear_user_return_notifier(tsk);	err = gpiochip_add(&port->bgc.gc);
+	clear_tsk_need_resched(tsk);	err = gpiochip_add(&port->bgc.gc);
+	stackend = end_of_stack(tsk);	err = gpiochip_add(&port->bgc.gc);
+	*stackend = STACK_END_MAGIC;	/* for overflow detection */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_CC_STACKPROTECTOR	err = gpiochip_add(&port->bgc.gc);
+	tsk->stack_canary = get_random_int();	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * One for us, one for whoever does the "release_task()" (usually	err = gpiochip_add(&port->bgc.gc);
+	 * parent)	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&tsk->usage, 2);	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_BLK_DEV_IO_TRACE	err = gpiochip_add(&port->bgc.gc);
+	tsk->btrace_seq = 0;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	tsk->splice_pipe = NULL;	err = gpiochip_add(&port->bgc.gc);
+	tsk->task_frag.page = NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	account_kernel_stack(ti, 1);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return tsk;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+free_ti:	err = gpiochip_add(&port->bgc.gc);
+	free_thread_info(ti);	err = gpiochip_add(&port->bgc.gc);
+free_tsk:	err = gpiochip_add(&port->bgc.gc);
+	free_task_struct(tsk);	err = gpiochip_add(&port->bgc.gc);
+	return NULL;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_MMU	err = gpiochip_add(&port->bgc.gc);
+static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct vm_area_struct *mpnt, *tmp, *prev, **pprev;	err = gpiochip_add(&port->bgc.gc);
+	struct rb_node **rb_link, *rb_parent;	err = gpiochip_add(&port->bgc.gc);
+	int retval;	err = gpiochip_add(&port->bgc.gc);
+	unsigned long charge;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	uprobe_start_dup_mmap();	err = gpiochip_add(&port->bgc.gc);
+	down_write(&oldmm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	flush_cache_dup_mm(oldmm);	err = gpiochip_add(&port->bgc.gc);
+	uprobe_dup_mmap(oldmm, mm);	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Not linked in yet - no deadlock potential:	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	down_write_nested(&mm->mmap_sem, SINGLE_DEPTH_NESTING);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mm->locked_vm = 0;	err = gpiochip_add(&port->bgc.gc);
+	mm->mmap = NULL;	err = gpiochip_add(&port->bgc.gc);
+	mm->mmap_cache = NULL;	err = gpiochip_add(&port->bgc.gc);
+	mm->map_count = 0;	err = gpiochip_add(&port->bgc.gc);
+	cpumask_clear(mm_cpumask(mm));	err = gpiochip_add(&port->bgc.gc);
+	mm->mm_rb = RB_ROOT;	err = gpiochip_add(&port->bgc.gc);
+	rb_link = &mm->mm_rb.rb_node;	err = gpiochip_add(&port->bgc.gc);
+	rb_parent = NULL;	err = gpiochip_add(&port->bgc.gc);
+	pprev = &mm->mmap;	err = gpiochip_add(&port->bgc.gc);
+	retval = ksm_fork(mm, oldmm);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto out;	err = gpiochip_add(&port->bgc.gc);
+	retval = khugepaged_fork(mm, oldmm);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto out;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	prev = NULL;	err = gpiochip_add(&port->bgc.gc);
+	for (mpnt = oldmm->mmap; mpnt; mpnt = mpnt->vm_next) {	err = gpiochip_add(&port->bgc.gc);
+		struct file *file;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (mpnt->vm_flags & VM_DONTCOPY) {	err = gpiochip_add(&port->bgc.gc);
+			vm_stat_account(mm, mpnt->vm_flags, mpnt->vm_file,	err = gpiochip_add(&port->bgc.gc);
+							-vma_pages(mpnt));	err = gpiochip_add(&port->bgc.gc);
+			continue;	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		charge = 0;	err = gpiochip_add(&port->bgc.gc);
+		if (mpnt->vm_flags & VM_ACCOUNT) {	err = gpiochip_add(&port->bgc.gc);
+			unsigned long len = vma_pages(mpnt);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+			if (security_vm_enough_memory_mm(oldmm, len)) /* sic */	err = gpiochip_add(&port->bgc.gc);
+				goto fail_nomem;	err = gpiochip_add(&port->bgc.gc);
+			charge = len;	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		tmp = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);	err = gpiochip_add(&port->bgc.gc);
+		if (!tmp)	err = gpiochip_add(&port->bgc.gc);
+			goto fail_nomem;	err = gpiochip_add(&port->bgc.gc);
+		*tmp = *mpnt;	err = gpiochip_add(&port->bgc.gc);
+		INIT_LIST_HEAD(&tmp->anon_vma_chain);	err = gpiochip_add(&port->bgc.gc);
+		retval = vma_dup_policy(mpnt, tmp);	err = gpiochip_add(&port->bgc.gc);
+		if (retval)	err = gpiochip_add(&port->bgc.gc);
+			goto fail_nomem_policy;	err = gpiochip_add(&port->bgc.gc);
+		tmp->vm_mm = mm;	err = gpiochip_add(&port->bgc.gc);
+		if (anon_vma_fork(tmp, mpnt))	err = gpiochip_add(&port->bgc.gc);
+			goto fail_nomem_anon_vma_fork;	err = gpiochip_add(&port->bgc.gc);
+		tmp->vm_flags &= ~VM_LOCKED;	err = gpiochip_add(&port->bgc.gc);
+		tmp->vm_next = tmp->vm_prev = NULL;	err = gpiochip_add(&port->bgc.gc);
+		file = tmp->vm_file;	err = gpiochip_add(&port->bgc.gc);
+		if (file) {	err = gpiochip_add(&port->bgc.gc);
+			struct inode *inode = file_inode(file);	err = gpiochip_add(&port->bgc.gc);
+			struct address_space *mapping = file->f_mapping;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+			get_file(file);	err = gpiochip_add(&port->bgc.gc);
+			if (tmp->vm_flags & VM_DENYWRITE)	err = gpiochip_add(&port->bgc.gc);
+				atomic_dec(&inode->i_writecount);	err = gpiochip_add(&port->bgc.gc);
+			mutex_lock(&mapping->i_mmap_mutex);	err = gpiochip_add(&port->bgc.gc);
+			if (tmp->vm_flags & VM_SHARED)	err = gpiochip_add(&port->bgc.gc);
+				mapping->i_mmap_writable++;	err = gpiochip_add(&port->bgc.gc);
+			flush_dcache_mmap_lock(mapping);	err = gpiochip_add(&port->bgc.gc);
+			/* insert tmp into the share list, just after mpnt */	err = gpiochip_add(&port->bgc.gc);
+			if (unlikely(tmp->vm_flags & VM_NONLINEAR))	err = gpiochip_add(&port->bgc.gc);
+				vma_nonlinear_insert(tmp,	err = gpiochip_add(&port->bgc.gc);
+						&mapping->i_mmap_nonlinear);	err = gpiochip_add(&port->bgc.gc);
+			else	err = gpiochip_add(&port->bgc.gc);
+				vma_interval_tree_insert_after(tmp, mpnt,	err = gpiochip_add(&port->bgc.gc);
+							&mapping->i_mmap);	err = gpiochip_add(&port->bgc.gc);
+			flush_dcache_mmap_unlock(mapping);	err = gpiochip_add(&port->bgc.gc);
+			mutex_unlock(&mapping->i_mmap_mutex);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		/*	err = gpiochip_add(&port->bgc.gc);
+		 * Clear hugetlb-related page reserves for children. This only	err = gpiochip_add(&port->bgc.gc);
+		 * affects MAP_PRIVATE mappings. Faults generated by the child	err = gpiochip_add(&port->bgc.gc);
+		 * are not guaranteed to succeed, even if read-only	err = gpiochip_add(&port->bgc.gc);
+		 */	err = gpiochip_add(&port->bgc.gc);
+		if (is_vm_hugetlb_page(tmp))	err = gpiochip_add(&port->bgc.gc);
+			reset_vma_resv_huge_pages(tmp);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		/*	err = gpiochip_add(&port->bgc.gc);
+		 * Link in the new vma and copy the page table entries.	err = gpiochip_add(&port->bgc.gc);
+		 */	err = gpiochip_add(&port->bgc.gc);
+		*pprev = tmp;	err = gpiochip_add(&port->bgc.gc);
+		pprev = &tmp->vm_next;	err = gpiochip_add(&port->bgc.gc);
+		tmp->vm_prev = prev;	err = gpiochip_add(&port->bgc.gc);
+		prev = tmp;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		__vma_link_rb(mm, tmp, rb_link, rb_parent);	err = gpiochip_add(&port->bgc.gc);
+		rb_link = &tmp->vm_rb.rb_right;	err = gpiochip_add(&port->bgc.gc);
+		rb_parent = &tmp->vm_rb;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		mm->map_count++;	err = gpiochip_add(&port->bgc.gc);
+		retval = copy_page_range(mm, oldmm, mpnt);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (tmp->vm_ops && tmp->vm_ops->open)	err = gpiochip_add(&port->bgc.gc);
+			tmp->vm_ops->open(tmp);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (retval)	err = gpiochip_add(&port->bgc.gc);
+			goto out;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	/* a new mm has just been created */	err = gpiochip_add(&port->bgc.gc);
+	arch_dup_mmap(oldmm, mm);	err = gpiochip_add(&port->bgc.gc);
+	retval = 0;	err = gpiochip_add(&port->bgc.gc);
+out:	err = gpiochip_add(&port->bgc.gc);
+	up_write(&mm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	flush_tlb_mm(oldmm);	err = gpiochip_add(&port->bgc.gc);
+	up_write(&oldmm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	uprobe_end_dup_mmap();	err = gpiochip_add(&port->bgc.gc);
+	return retval;	err = gpiochip_add(&port->bgc.gc);
+fail_nomem_anon_vma_fork:	err = gpiochip_add(&port->bgc.gc);
+	mpol_put(vma_policy(tmp));	err = gpiochip_add(&port->bgc.gc);
+fail_nomem_policy:	err = gpiochip_add(&port->bgc.gc);
+	kmem_cache_free(vm_area_cachep, tmp);	err = gpiochip_add(&port->bgc.gc);
+fail_nomem:	err = gpiochip_add(&port->bgc.gc);
+	retval = -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	vm_unacct_memory(charge);	err = gpiochip_add(&port->bgc.gc);
+	goto out;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline int mm_alloc_pgd(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	mm->pgd = pgd_alloc(mm);	err = gpiochip_add(&port->bgc.gc);
+	if (unlikely(!mm->pgd))	err = gpiochip_add(&port->bgc.gc);
+		return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void mm_free_pgd(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	pgd_free(mm, mm->pgd);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#else	err = gpiochip_add(&port->bgc.gc);
+#define dup_mmap(mm, oldmm)	(0)	err = gpiochip_add(&port->bgc.gc);
+#define mm_alloc_pgd(mm)	(0)	err = gpiochip_add(&port->bgc.gc);
+#define mm_free_pgd(mm)	err = gpiochip_add(&port->bgc.gc);
+#endif /* CONFIG_MMU */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+__cacheline_aligned_in_smp DEFINE_SPINLOCK(mmlist_lock);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#define allocate_mm()	(kmem_cache_alloc(mm_cachep, GFP_KERNEL))	err = gpiochip_add(&port->bgc.gc);
+#define free_mm(mm)	(kmem_cache_free(mm_cachep, (mm)))	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static unsigned long default_dump_filter = MMF_DUMP_FILTER_DEFAULT;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int __init coredump_filter_setup(char *s)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	default_dump_filter =	err = gpiochip_add(&port->bgc.gc);
+		(simple_strtoul(s, NULL, 0) << MMF_DUMP_FILTER_SHIFT) &	err = gpiochip_add(&port->bgc.gc);
+		MMF_DUMP_FILTER_MASK;	err = gpiochip_add(&port->bgc.gc);
+	return 1;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+__setup("coredump_filter=", coredump_filter_setup);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#include <linux/init_task.h>	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void mm_init_aio(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_AIO	err = gpiochip_add(&port->bgc.gc);
+	spin_lock_init(&mm->ioctx_lock);	err = gpiochip_add(&port->bgc.gc);
+	mm->ioctx_table = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&mm->mm_users, 1);	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&mm->mm_count, 1);	err = gpiochip_add(&port->bgc.gc);
+	init_rwsem(&mm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&mm->mmlist);	err = gpiochip_add(&port->bgc.gc);
+	mm->flags = (current->mm) ?	err = gpiochip_add(&port->bgc.gc);
+		(current->mm->flags & MMF_INIT_MASK) : default_dump_filter;	err = gpiochip_add(&port->bgc.gc);
+	mm->core_state = NULL;	err = gpiochip_add(&port->bgc.gc);
+	atomic_long_set(&mm->nr_ptes, 0);	err = gpiochip_add(&port->bgc.gc);
+	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));	err = gpiochip_add(&port->bgc.gc);
+	spin_lock_init(&mm->page_table_lock);	err = gpiochip_add(&port->bgc.gc);
+	mm_init_aio(mm);	err = gpiochip_add(&port->bgc.gc);
+	mm_init_owner(mm, p);	err = gpiochip_add(&port->bgc.gc);
+	clear_tlb_flush_pending(mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (likely(!mm_alloc_pgd(mm))) {	err = gpiochip_add(&port->bgc.gc);
+		mm->def_flags = 0;	err = gpiochip_add(&port->bgc.gc);
+		mmu_notifier_mm_init(mm);	err = gpiochip_add(&port->bgc.gc);
+		return mm;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	free_mm(mm);	err = gpiochip_add(&port->bgc.gc);
+	return NULL;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void check_mm(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	int i;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	for (i = 0; i < NR_MM_COUNTERS; i++) {	err = gpiochip_add(&port->bgc.gc);
+		long x = atomic_long_read(&mm->rss_stat.count[i]);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (unlikely(x))	err = gpiochip_add(&port->bgc.gc);
+			printk(KERN_ALERT "BUG: Bad rss-counter state "	err = gpiochip_add(&port->bgc.gc);
+					  "mm:%p idx:%d val:%ld\n", mm, i, x);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS	err = gpiochip_add(&port->bgc.gc);
+	VM_BUG_ON(mm->pmd_huge_pte);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Allocate and initialize an mm_struct.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+struct mm_struct *mm_alloc(void)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct mm_struct *mm;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mm = allocate_mm();	err = gpiochip_add(&port->bgc.gc);
+	if (!mm)	err = gpiochip_add(&port->bgc.gc);
+		return NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	memset(mm, 0, sizeof(*mm));	err = gpiochip_add(&port->bgc.gc);
+	mm_init_cpumask(mm);	err = gpiochip_add(&port->bgc.gc);
+	return mm_init(mm, current);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Called when the last reference to the mm	err = gpiochip_add(&port->bgc.gc);
+ * is dropped: either by a lazy thread or by	err = gpiochip_add(&port->bgc.gc);
+ * mmput. Free the page directory and the mm.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+void __mmdrop(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	BUG_ON(mm == &init_mm);	err = gpiochip_add(&port->bgc.gc);
+	mm_free_pgd(mm);	err = gpiochip_add(&port->bgc.gc);
+	destroy_context(mm);	err = gpiochip_add(&port->bgc.gc);
+	mmu_notifier_mm_destroy(mm);	err = gpiochip_add(&port->bgc.gc);
+	check_mm(mm);	err = gpiochip_add(&port->bgc.gc);
+	free_mm(mm);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL_GPL(__mmdrop);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Decrement the use count and release all resources for an mm.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+void mmput(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	might_sleep();	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (atomic_dec_and_test(&mm->mm_users)) {	err = gpiochip_add(&port->bgc.gc);
+		uprobe_clear_state(mm);	err = gpiochip_add(&port->bgc.gc);
+		exit_aio(mm);	err = gpiochip_add(&port->bgc.gc);
+		ksm_exit(mm);	err = gpiochip_add(&port->bgc.gc);
+		khugepaged_exit(mm); /* must run before exit_mmap */	err = gpiochip_add(&port->bgc.gc);
+		exit_mmap(mm);	err = gpiochip_add(&port->bgc.gc);
+		set_mm_exe_file(mm, NULL);	err = gpiochip_add(&port->bgc.gc);
+		if (!list_empty(&mm->mmlist)) {	err = gpiochip_add(&port->bgc.gc);
+			spin_lock(&mmlist_lock);	err = gpiochip_add(&port->bgc.gc);
+			list_del(&mm->mmlist);	err = gpiochip_add(&port->bgc.gc);
+			spin_unlock(&mmlist_lock);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		if (mm->binfmt)	err = gpiochip_add(&port->bgc.gc);
+			module_put(mm->binfmt->module);	err = gpiochip_add(&port->bgc.gc);
+		mmdrop(mm);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL_GPL(mmput);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	if (new_exe_file)	err = gpiochip_add(&port->bgc.gc);
+		get_file(new_exe_file);	err = gpiochip_add(&port->bgc.gc);
+	if (mm->exe_file)	err = gpiochip_add(&port->bgc.gc);
+		fput(mm->exe_file);	err = gpiochip_add(&port->bgc.gc);
+	mm->exe_file = new_exe_file;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+struct file *get_mm_exe_file(struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct file *exe_file;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* We need mmap_sem to protect against races with removal of exe_file */	err = gpiochip_add(&port->bgc.gc);
+	down_read(&mm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	exe_file = mm->exe_file;	err = gpiochip_add(&port->bgc.gc);
+	if (exe_file)	err = gpiochip_add(&port->bgc.gc);
+		get_file(exe_file);	err = gpiochip_add(&port->bgc.gc);
+	up_read(&mm->mmap_sem);	err = gpiochip_add(&port->bgc.gc);
+	return exe_file;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void dup_mm_exe_file(struct mm_struct *oldmm, struct mm_struct *newmm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	/* It's safe to write the exe_file pointer without exe_file_lock because	err = gpiochip_add(&port->bgc.gc);
+	 * this is called during fork when the task is not yet in /proc */	err = gpiochip_add(&port->bgc.gc);
+	newmm->exe_file = get_mm_exe_file(oldmm);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/**	err = gpiochip_add(&port->bgc.gc);
+ * get_task_mm - acquire a reference to the task's mm	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ * Returns %NULL if the task has no mm.  Checks PF_KTHREAD (meaning	err = gpiochip_add(&port->bgc.gc);
+ * this kernel workthread has transiently adopted a user mm with use_mm,	err = gpiochip_add(&port->bgc.gc);
+ * to do its AIO) is not set and if so returns a reference to it, after	err = gpiochip_add(&port->bgc.gc);
+ * bumping up the use count.  User must release the mm via mmput()	err = gpiochip_add(&port->bgc.gc);
+ * after use.  Typically used by /proc and ptrace.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+struct mm_struct *get_task_mm(struct task_struct *task)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct mm_struct *mm;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	task_lock(task);	err = gpiochip_add(&port->bgc.gc);
+	mm = task->mm;	err = gpiochip_add(&port->bgc.gc);
+	if (mm) {	err = gpiochip_add(&port->bgc.gc);
+		if (task->flags & PF_KTHREAD)	err = gpiochip_add(&port->bgc.gc);
+			mm = NULL;	err = gpiochip_add(&port->bgc.gc);
+		else	err = gpiochip_add(&port->bgc.gc);
+			atomic_inc(&mm->mm_users);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	task_unlock(task);	err = gpiochip_add(&port->bgc.gc);
+	return mm;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+EXPORT_SYMBOL_GPL(get_task_mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+struct mm_struct *mm_access(struct task_struct *task, unsigned int mode)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct mm_struct *mm;	err = gpiochip_add(&port->bgc.gc);
+	int err;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	err =  mutex_lock_killable(&task->signal->cred_guard_mutex);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(err);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mm = get_task_mm(task);	err = gpiochip_add(&port->bgc.gc);
+	if (mm && mm != current->mm &&	err = gpiochip_add(&port->bgc.gc);
+			!ptrace_may_access(task, mode)) {	err = gpiochip_add(&port->bgc.gc);
+		mmput(mm);	err = gpiochip_add(&port->bgc.gc);
+		mm = ERR_PTR(-EACCES);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	mutex_unlock(&task->signal->cred_guard_mutex);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return mm;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void complete_vfork_done(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct completion *vfork;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	task_lock(tsk);	err = gpiochip_add(&port->bgc.gc);
+	vfork = tsk->vfork_done;	err = gpiochip_add(&port->bgc.gc);
+	if (likely(vfork)) {	err = gpiochip_add(&port->bgc.gc);
+		tsk->vfork_done = NULL;	err = gpiochip_add(&port->bgc.gc);
+		complete(vfork);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	task_unlock(tsk);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int wait_for_vfork_done(struct task_struct *child,	err = gpiochip_add(&port->bgc.gc);
+				struct completion *vfork)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	int killed;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	freezer_do_not_count();	err = gpiochip_add(&port->bgc.gc);
+	killed = wait_for_completion_killable(vfork);	err = gpiochip_add(&port->bgc.gc);
+	freezer_count();	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (killed) {	err = gpiochip_add(&port->bgc.gc);
+		task_lock(child);	err = gpiochip_add(&port->bgc.gc);
+		child->vfork_done = NULL;	err = gpiochip_add(&port->bgc.gc);
+		task_unlock(child);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	put_task_struct(child);	err = gpiochip_add(&port->bgc.gc);
+	return killed;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/* Please note the differences between mmput and mm_release.	err = gpiochip_add(&port->bgc.gc);
+ * mmput is called whenever we stop holding onto a mm_struct,	err = gpiochip_add(&port->bgc.gc);
+ * error success whatever.	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ * mm_release is called after a mm_struct has been removed	err = gpiochip_add(&port->bgc.gc);
+ * from the current process.	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ * This difference is important for error handling, when we	err = gpiochip_add(&port->bgc.gc);
+ * only half set up a mm_struct for a new process and need to restore	err = gpiochip_add(&port->bgc.gc);
+ * the old one.  Because we mmput the new mm_struct before	err = gpiochip_add(&port->bgc.gc);
+ * restoring the old one. . .	err = gpiochip_add(&port->bgc.gc);
+ * Eric Biederman 10 January 1998	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+void mm_release(struct task_struct *tsk, struct mm_struct *mm)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	/* Get rid of any futexes when releasing the mm */	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_FUTEX	err = gpiochip_add(&port->bgc.gc);
+	if (unlikely(tsk->robust_list)) {	err = gpiochip_add(&port->bgc.gc);
+		exit_robust_list(tsk);	err = gpiochip_add(&port->bgc.gc);
+		tsk->robust_list = NULL;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_COMPAT	err = gpiochip_add(&port->bgc.gc);
+	if (unlikely(tsk->compat_robust_list)) {	err = gpiochip_add(&port->bgc.gc);
+		compat_exit_robust_list(tsk);	err = gpiochip_add(&port->bgc.gc);
+		tsk->compat_robust_list = NULL;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	if (unlikely(!list_empty(&tsk->pi_state_list)))	err = gpiochip_add(&port->bgc.gc);
+		exit_pi_state_list(tsk);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	uprobe_free_utask(tsk);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* Get rid of any cached register state */	err = gpiochip_add(&port->bgc.gc);
+	deactivate_mm(tsk, mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If we're exiting normally, clear a user-space tid field if	err = gpiochip_add(&port->bgc.gc);
+	 * requested.  We leave this alone when dying by signal, to leave	err = gpiochip_add(&port->bgc.gc);
+	 * the value intact in a core dump, and to save the unnecessary	err = gpiochip_add(&port->bgc.gc);
+	 * trouble, say, a killed vfork parent shouldn't touch this mm.	err = gpiochip_add(&port->bgc.gc);
+	 * Userland only wants this done for a sys_exit.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (tsk->clear_child_tid) {	err = gpiochip_add(&port->bgc.gc);
+		if (!(tsk->flags & PF_SIGNALED) &&	err = gpiochip_add(&port->bgc.gc);
+		    atomic_read(&mm->mm_users) > 1) {	err = gpiochip_add(&port->bgc.gc);
+			/*	err = gpiochip_add(&port->bgc.gc);
+			 * We don't check the error code - if userspace has	err = gpiochip_add(&port->bgc.gc);
+			 * not set up a proper pointer then tough luck.	err = gpiochip_add(&port->bgc.gc);
+			 */	err = gpiochip_add(&port->bgc.gc);
+			put_user(0, tsk->clear_child_tid);	err = gpiochip_add(&port->bgc.gc);
+			sys_futex(tsk->clear_child_tid, FUTEX_WAKE,	err = gpiochip_add(&port->bgc.gc);
+					1, NULL, NULL, 0);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		tsk->clear_child_tid = NULL;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * All done, finally we can wake up parent and return this mm to him.	err = gpiochip_add(&port->bgc.gc);
+	 * Also kthread_stop() uses this completion for synchronization.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (tsk->vfork_done)	err = gpiochip_add(&port->bgc.gc);
+		complete_vfork_done(tsk);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Allocate a new mm structure and copy contents from the	err = gpiochip_add(&port->bgc.gc);
+ * mm structure of the passed in task structure.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static struct mm_struct *dup_mm(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct mm_struct *mm, *oldmm = current->mm;	err = gpiochip_add(&port->bgc.gc);
+	int err;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mm = allocate_mm();	err = gpiochip_add(&port->bgc.gc);
+	if (!mm)	err = gpiochip_add(&port->bgc.gc);
+		goto fail_nomem;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	memcpy(mm, oldmm, sizeof(*mm));	err = gpiochip_add(&port->bgc.gc);
+	mm_init_cpumask(mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS	err = gpiochip_add(&port->bgc.gc);
+	mm->pmd_huge_pte = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	if (!mm_init(mm, tsk))	err = gpiochip_add(&port->bgc.gc);
+		goto fail_nomem;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (init_new_context(tsk, mm))	err = gpiochip_add(&port->bgc.gc);
+		goto fail_nocontext;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	dup_mm_exe_file(oldmm, mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	err = dup_mmap(mm, oldmm);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto free_pt;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mm->hiwater_rss = get_mm_rss(mm);	err = gpiochip_add(&port->bgc.gc);
+	mm->hiwater_vm = mm->total_vm;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (mm->binfmt && !try_module_get(mm->binfmt->module))	err = gpiochip_add(&port->bgc.gc);
+		goto free_pt;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return mm;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+free_pt:	err = gpiochip_add(&port->bgc.gc);
+	/* don't put binfmt in mmput, we haven't got module yet */	err = gpiochip_add(&port->bgc.gc);
+	mm->binfmt = NULL;	err = gpiochip_add(&port->bgc.gc);
+	mmput(mm);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+fail_nomem:	err = gpiochip_add(&port->bgc.gc);
+	return NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+fail_nocontext:	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If init_new_context() failed, we cannot use mmput() to free the mm	err = gpiochip_add(&port->bgc.gc);
+	 * because it calls destroy_context()	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	mm_free_pgd(mm);	err = gpiochip_add(&port->bgc.gc);
+	free_mm(mm);	err = gpiochip_add(&port->bgc.gc);
+	return NULL;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct mm_struct *mm, *oldmm;	err = gpiochip_add(&port->bgc.gc);
+	int retval;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tsk->min_flt = tsk->maj_flt = 0;	err = gpiochip_add(&port->bgc.gc);
+	tsk->nvcsw = tsk->nivcsw = 0;	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_DETECT_HUNG_TASK	err = gpiochip_add(&port->bgc.gc);
+	tsk->last_switch_count = tsk->nvcsw + tsk->nivcsw;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tsk->mm = NULL;	err = gpiochip_add(&port->bgc.gc);
+	tsk->active_mm = NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Are we cloning a kernel thread?	err = gpiochip_add(&port->bgc.gc);
+	 *	err = gpiochip_add(&port->bgc.gc);
+	 * We need to steal a active VM for that..	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	oldmm = current->mm;	err = gpiochip_add(&port->bgc.gc);
+	if (!oldmm)	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_VM) {	err = gpiochip_add(&port->bgc.gc);
+		atomic_inc(&oldmm->mm_users);	err = gpiochip_add(&port->bgc.gc);
+		mm = oldmm;	err = gpiochip_add(&port->bgc.gc);
+		goto good_mm;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	retval = -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	mm = dup_mm(tsk);	err = gpiochip_add(&port->bgc.gc);
+	if (!mm)	err = gpiochip_add(&port->bgc.gc);
+		goto fail_nomem;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+good_mm:	err = gpiochip_add(&port->bgc.gc);
+	tsk->mm = mm;	err = gpiochip_add(&port->bgc.gc);
+	tsk->active_mm = mm;	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+fail_nomem:	err = gpiochip_add(&port->bgc.gc);
+	return retval;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_fs(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct fs_struct *fs = current->fs;	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_FS) {	err = gpiochip_add(&port->bgc.gc);
+		/* tsk->fs is already what we want */	err = gpiochip_add(&port->bgc.gc);
+		spin_lock(&fs->lock);	err = gpiochip_add(&port->bgc.gc);
+		if (fs->in_exec) {	err = gpiochip_add(&port->bgc.gc);
+			spin_unlock(&fs->lock);	err = gpiochip_add(&port->bgc.gc);
+			return -EAGAIN;	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		fs->users++;	err = gpiochip_add(&port->bgc.gc);
+		spin_unlock(&fs->lock);	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	tsk->fs = copy_fs_struct(fs);	err = gpiochip_add(&port->bgc.gc);
+	if (!tsk->fs)	err = gpiochip_add(&port->bgc.gc);
+		return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_files(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct files_struct *oldf, *newf;	err = gpiochip_add(&port->bgc.gc);
+	int error = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * A background process may not have any files ...	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	oldf = current->files;	err = gpiochip_add(&port->bgc.gc);
+	if (!oldf)	err = gpiochip_add(&port->bgc.gc);
+		goto out;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_FILES) {	err = gpiochip_add(&port->bgc.gc);
+		atomic_inc(&oldf->count);	err = gpiochip_add(&port->bgc.gc);
+		goto out;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	newf = dup_fd(oldf, &error);	err = gpiochip_add(&port->bgc.gc);
+	if (!newf)	err = gpiochip_add(&port->bgc.gc);
+		goto out;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tsk->files = newf;	err = gpiochip_add(&port->bgc.gc);
+	error = 0;	err = gpiochip_add(&port->bgc.gc);
+out:	err = gpiochip_add(&port->bgc.gc);
+	return error;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_io(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_BLOCK	err = gpiochip_add(&port->bgc.gc);
+	struct io_context *ioc = current->io_context;	err = gpiochip_add(&port->bgc.gc);
+	struct io_context *new_ioc;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (!ioc)	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Share io context with parent, if CLONE_IO is set	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_IO) {	err = gpiochip_add(&port->bgc.gc);
+		ioc_task_link(ioc);	err = gpiochip_add(&port->bgc.gc);
+		tsk->io_context = ioc;	err = gpiochip_add(&port->bgc.gc);
+	} else if (ioprio_valid(ioc->ioprio)) {	err = gpiochip_add(&port->bgc.gc);
+		new_ioc = get_task_io_context(tsk, GFP_KERNEL, NUMA_NO_NODE);	err = gpiochip_add(&port->bgc.gc);
+		if (unlikely(!new_ioc))	err = gpiochip_add(&port->bgc.gc);
+			return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		new_ioc->ioprio = ioc->ioprio;	err = gpiochip_add(&port->bgc.gc);
+		put_io_context(new_ioc);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_sighand(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct sighand_struct *sig;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_SIGHAND) {	err = gpiochip_add(&port->bgc.gc);
+		atomic_inc(&current->sighand->count);	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	sig = kmem_cache_alloc(sighand_cachep, GFP_KERNEL);	err = gpiochip_add(&port->bgc.gc);
+	rcu_assign_pointer(tsk->sighand, sig);	err = gpiochip_add(&port->bgc.gc);
+	if (!sig)	err = gpiochip_add(&port->bgc.gc);
+		return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&sig->count, 1);	err = gpiochip_add(&port->bgc.gc);
+	memcpy(sig->action, current->sighand->action, sizeof(sig->action));	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __cleanup_sighand(struct sighand_struct *sighand)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	if (atomic_dec_and_test(&sighand->count)) {	err = gpiochip_add(&port->bgc.gc);
+		signalfd_cleanup(sighand);	err = gpiochip_add(&port->bgc.gc);
+		kmem_cache_free(sighand_cachep, sighand);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Initialize POSIX timer handling for a thread group.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static void posix_cpu_timers_init_group(struct signal_struct *sig)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	unsigned long cpu_limit;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* Thread group counters. */	err = gpiochip_add(&port->bgc.gc);
+	thread_group_cputime_init(sig);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	cpu_limit = ACCESS_ONCE(sig->rlim[RLIMIT_CPU].rlim_cur);	err = gpiochip_add(&port->bgc.gc);
+	if (cpu_limit != RLIM_INFINITY) {	err = gpiochip_add(&port->bgc.gc);
+		sig->cputime_expires.prof_exp = secs_to_cputime(cpu_limit);	err = gpiochip_add(&port->bgc.gc);
+		sig->cputimer.running = 1;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* The timer lists. */	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&sig->cpu_timers[0]);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&sig->cpu_timers[1]);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&sig->cpu_timers[2]);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct signal_struct *sig;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_THREAD)	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	sig = kmem_cache_zalloc(signal_cachep, GFP_KERNEL);	err = gpiochip_add(&port->bgc.gc);
+	tsk->signal = sig;	err = gpiochip_add(&port->bgc.gc);
+	if (!sig)	err = gpiochip_add(&port->bgc.gc);
+		return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	sig->nr_threads = 1;	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&sig->live, 1);	err = gpiochip_add(&port->bgc.gc);
+	atomic_set(&sig->sigcnt, 1);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* list_add(thread_node, thread_head) without INIT_LIST_HEAD() */	err = gpiochip_add(&port->bgc.gc);
+	sig->thread_head = (struct list_head)LIST_HEAD_INIT(tsk->thread_node);	err = gpiochip_add(&port->bgc.gc);
+	tsk->thread_node = (struct list_head)LIST_HEAD_INIT(sig->thread_head);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	init_waitqueue_head(&sig->wait_chldexit);	err = gpiochip_add(&port->bgc.gc);
+	sig->curr_target = tsk;	err = gpiochip_add(&port->bgc.gc);
+	init_sigpending(&sig->shared_pending);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&sig->posix_timers);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	hrtimer_init(&sig->real_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);	err = gpiochip_add(&port->bgc.gc);
+	sig->real_timer.function = it_real_fn;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	task_lock(current->group_leader);	err = gpiochip_add(&port->bgc.gc);
+	memcpy(sig->rlim, current->signal->rlim, sizeof sig->rlim);	err = gpiochip_add(&port->bgc.gc);
+	task_unlock(current->group_leader);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	posix_cpu_timers_init_group(sig);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	tty_audit_fork(sig);	err = gpiochip_add(&port->bgc.gc);
+	sched_autogroup_fork(sig);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_CGROUPS	err = gpiochip_add(&port->bgc.gc);
+	init_rwsem(&sig->group_rwsem);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	sig->oom_score_adj = current->signal->oom_score_adj;	err = gpiochip_add(&port->bgc.gc);
+	sig->oom_score_adj_min = current->signal->oom_score_adj_min;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	sig->has_child_subreaper = current->signal->has_child_subreaper ||	err = gpiochip_add(&port->bgc.gc);
+				   current->signal->is_child_subreaper;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	mutex_init(&sig->cred_guard_mutex);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void copy_flags(unsigned long clone_flags, struct task_struct *p)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	unsigned long new_flags = p->flags;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	new_flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER);	err = gpiochip_add(&port->bgc.gc);
+	new_flags |= PF_FORKNOEXEC;	err = gpiochip_add(&port->bgc.gc);
+	p->flags = new_flags;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	current->clear_child_tid = tidptr;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return task_pid_vnr(current);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void rt_mutex_init_task(struct task_struct *p)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	raw_spin_lock_init(&p->pi_lock);	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_RT_MUTEXES	err = gpiochip_add(&port->bgc.gc);
+	p->pi_waiters = RB_ROOT;	err = gpiochip_add(&port->bgc.gc);
+	p->pi_waiters_leftmost = NULL;	err = gpiochip_add(&port->bgc.gc);
+	p->pi_blocked_on = NULL;	err = gpiochip_add(&port->bgc.gc);
+	p->pi_top_task = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_MM_OWNER	err = gpiochip_add(&port->bgc.gc);
+void mm_init_owner(struct mm_struct *mm, struct task_struct *p)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	mm->owner = p;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#endif /* CONFIG_MM_OWNER */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Initialize POSIX timer handling for a single task.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static void posix_cpu_timers_init(struct task_struct *tsk)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	tsk->cputime_expires.prof_exp = 0;	err = gpiochip_add(&port->bgc.gc);
+	tsk->cputime_expires.virt_exp = 0;	err = gpiochip_add(&port->bgc.gc);
+	tsk->cputime_expires.sched_exp = 0;	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&tsk->cpu_timers[0]);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&tsk->cpu_timers[1]);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&tsk->cpu_timers[2]);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void	err = gpiochip_add(&port->bgc.gc);
+init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	 task->pids[type].pid = pid;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * This creates a new process as a copy of the old one,	err = gpiochip_add(&port->bgc.gc);
+ * but does not actually start it yet.	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ * It copies the registers, and all the appropriate	err = gpiochip_add(&port->bgc.gc);
+ * parts of the process environment (as per the clone	err = gpiochip_add(&port->bgc.gc);
+ * flags). The actual kick-off is left to the caller.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static struct task_struct *copy_process(unsigned long clone_flags,	err = gpiochip_add(&port->bgc.gc);
+					unsigned long stack_start,	err = gpiochip_add(&port->bgc.gc);
+					unsigned long stack_size,	err = gpiochip_add(&port->bgc.gc);
+					int __user *child_tidptr,	err = gpiochip_add(&port->bgc.gc);
+					struct pid *pid,	err = gpiochip_add(&port->bgc.gc);
+					int trace)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	int retval;	err = gpiochip_add(&port->bgc.gc);
+	struct task_struct *p;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Thread groups must share signals as well, and detached threads	err = gpiochip_add(&port->bgc.gc);
+	 * can only be started up within the thread group.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & CLONE_THREAD) && !(clone_flags & CLONE_SIGHAND))	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Shared signal handlers imply shared VM. By way of the above,	err = gpiochip_add(&port->bgc.gc);
+	 * thread groups also imply shared VM. Blocking this case allows	err = gpiochip_add(&port->bgc.gc);
+	 * for various simplifications in other code.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & CLONE_SIGHAND) && !(clone_flags & CLONE_VM))	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Siblings of global init remain as zombies on exit since they are	err = gpiochip_add(&port->bgc.gc);
+	 * not reaped by their parent (swapper). To solve this and to avoid	err = gpiochip_add(&port->bgc.gc);
+	 * multi-rooted process trees, prevent global and container-inits	err = gpiochip_add(&port->bgc.gc);
+	 * from creating siblings.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & CLONE_PARENT) &&	err = gpiochip_add(&port->bgc.gc);
+				current->signal->flags & SIGNAL_UNKILLABLE)	err = gpiochip_add(&port->bgc.gc);
+		return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If the new process will be in a different pid or user namespace	err = gpiochip_add(&port->bgc.gc);
+	 * do not allow it to share a thread group or signal handlers or	err = gpiochip_add(&port->bgc.gc);
+	 * parent with the forking task.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_SIGHAND) {	err = gpiochip_add(&port->bgc.gc);
+		if ((clone_flags & (CLONE_NEWUSER | CLONE_NEWPID)) ||	err = gpiochip_add(&port->bgc.gc);
+		    (task_active_pid_ns(current) !=	err = gpiochip_add(&port->bgc.gc);
+				current->nsproxy->pid_ns_for_children))	err = gpiochip_add(&port->bgc.gc);
+			return ERR_PTR(-EINVAL);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	retval = security_task_create(clone_flags);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto fork_out;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	retval = -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	p = dup_task_struct(current);	err = gpiochip_add(&port->bgc.gc);
+	if (!p)	err = gpiochip_add(&port->bgc.gc);
+		goto fork_out;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	ftrace_graph_init_task(p);	err = gpiochip_add(&port->bgc.gc);
+	get_seccomp_filter(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	rt_mutex_init_task(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_PROVE_LOCKING	err = gpiochip_add(&port->bgc.gc);
+	DEBUG_LOCKS_WARN_ON(!p->hardirqs_enabled);	err = gpiochip_add(&port->bgc.gc);
+	DEBUG_LOCKS_WARN_ON(!p->softirqs_enabled);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	retval = -EAGAIN;	err = gpiochip_add(&port->bgc.gc);
+	if (atomic_read(&p->real_cred->user->processes) >=	err = gpiochip_add(&port->bgc.gc);
+			task_rlimit(p, RLIMIT_NPROC)) {	err = gpiochip_add(&port->bgc.gc);
+		if (p->real_cred->user != INIT_USER &&	err = gpiochip_add(&port->bgc.gc);
+		    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))	err = gpiochip_add(&port->bgc.gc);
+			goto bad_fork_free;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	current->flags &= ~PF_NPROC_EXCEEDED;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_creds(p, clone_flags);	err = gpiochip_add(&port->bgc.gc);
+	if (retval < 0)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_free;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If multiple threads are within copy_process(), then this check	err = gpiochip_add(&port->bgc.gc);
+	 * triggers too late. This doesn't hurt, the check is only there	err = gpiochip_add(&port->bgc.gc);
+	 * to stop root fork bombs.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	retval = -EAGAIN;	err = gpiochip_add(&port->bgc.gc);
+	if (nr_threads >= max_threads)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_count;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (!try_module_get(task_thread_info(p)->exec_domain->module))	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_count;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */	err = gpiochip_add(&port->bgc.gc);
+	copy_flags(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&p->children);	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&p->sibling);	err = gpiochip_add(&port->bgc.gc);
+	rcu_copy_process(p);	err = gpiochip_add(&port->bgc.gc);
+	p->vfork_done = NULL;	err = gpiochip_add(&port->bgc.gc);
+	spin_lock_init(&p->alloc_lock);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	init_sigpending(&p->pending);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p->utime = p->stime = p->gtime = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->utimescaled = p->stimescaled = 0;	err = gpiochip_add(&port->bgc.gc);
+#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE	err = gpiochip_add(&port->bgc.gc);
+	p->prev_cputime.utime = p->prev_cputime.stime = 0;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN	err = gpiochip_add(&port->bgc.gc);
+	seqlock_init(&p->vtime_seqlock);	err = gpiochip_add(&port->bgc.gc);
+	p->vtime_snap = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->vtime_snap_whence = VTIME_SLEEPING;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#if defined(SPLIT_RSS_COUNTING)	err = gpiochip_add(&port->bgc.gc);
+	memset(&p->rss_stat, 0, sizeof(p->rss_stat));	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p->default_timer_slack_ns = current->timer_slack_ns;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	task_io_accounting_init(&p->ioac);	err = gpiochip_add(&port->bgc.gc);
+	acct_clear_integrals(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	posix_cpu_timers_init(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	do_posix_clock_monotonic_gettime(&p->start_time);	err = gpiochip_add(&port->bgc.gc);
+	p->real_start_time = p->start_time;	err = gpiochip_add(&port->bgc.gc);
+	monotonic_to_bootbased(&p->real_start_time);	err = gpiochip_add(&port->bgc.gc);
+	p->io_context = NULL;	err = gpiochip_add(&port->bgc.gc);
+	p->audit_context = NULL;	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_THREAD)	err = gpiochip_add(&port->bgc.gc);
+		threadgroup_change_begin(current);	err = gpiochip_add(&port->bgc.gc);
+	cgroup_fork(p);	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_NUMA	err = gpiochip_add(&port->bgc.gc);
+	p->mempolicy = mpol_dup(p->mempolicy);	err = gpiochip_add(&port->bgc.gc);
+	if (IS_ERR(p->mempolicy)) {	err = gpiochip_add(&port->bgc.gc);
+		retval = PTR_ERR(p->mempolicy);	err = gpiochip_add(&port->bgc.gc);
+		p->mempolicy = NULL;	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_cgroup;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	mpol_fix_fork_child_flag(p);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_CPUSETS	err = gpiochip_add(&port->bgc.gc);
+	p->cpuset_mem_spread_rotor = NUMA_NO_NODE;	err = gpiochip_add(&port->bgc.gc);
+	p->cpuset_slab_spread_rotor = NUMA_NO_NODE;	err = gpiochip_add(&port->bgc.gc);
+	seqcount_init(&p->mems_allowed_seq);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_TRACE_IRQFLAGS	err = gpiochip_add(&port->bgc.gc);
+	p->irq_events = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirqs_enabled = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirq_enable_ip = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirq_enable_event = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirq_disable_ip = _THIS_IP_;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirq_disable_event = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->softirqs_enabled = 1;	err = gpiochip_add(&port->bgc.gc);
+	p->softirq_enable_ip = _THIS_IP_;	err = gpiochip_add(&port->bgc.gc);
+	p->softirq_enable_event = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->softirq_disable_ip = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->softirq_disable_event = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->hardirq_context = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->softirq_context = 0;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_LOCKDEP	err = gpiochip_add(&port->bgc.gc);
+	p->lockdep_depth = 0; /* no locks held yet */	err = gpiochip_add(&port->bgc.gc);
+	p->curr_chain_key = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->lockdep_recursion = 0;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_DEBUG_MUTEXES	err = gpiochip_add(&port->bgc.gc);
+	p->blocked_on = NULL; /* not blocked yet */	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_MEMCG	err = gpiochip_add(&port->bgc.gc);
+	p->memcg_batch.do_batch = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->memcg_batch.memcg = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_BCACHE	err = gpiochip_add(&port->bgc.gc);
+	p->sequential_io	= 0;	err = gpiochip_add(&port->bgc.gc);
+	p->sequential_io_avg	= 0;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* Perform scheduler related setup. Assign this task to a CPU. */	err = gpiochip_add(&port->bgc.gc);
+	retval = sched_fork(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_policy;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	retval = perf_event_init_task(p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_policy;	err = gpiochip_add(&port->bgc.gc);
+	retval = audit_alloc(p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_policy;	err = gpiochip_add(&port->bgc.gc);
+	/* copy all the process information */	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_semundo(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_audit;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_files(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_semundo;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_fs(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_files;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_sighand(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_fs;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_signal(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_sighand;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_mm(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_signal;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_namespaces(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_mm;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_io(clone_flags, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_namespaces;	err = gpiochip_add(&port->bgc.gc);
+	retval = copy_thread(clone_flags, stack_start, stack_size, p);	err = gpiochip_add(&port->bgc.gc);
+	if (retval)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_cleanup_io;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (pid != &init_struct_pid) {	err = gpiochip_add(&port->bgc.gc);
+		retval = -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+		pid = alloc_pid(p->nsproxy->pid_ns_for_children);	err = gpiochip_add(&port->bgc.gc);
+		if (!pid)	err = gpiochip_add(&port->bgc.gc);
+			goto bad_fork_cleanup_io;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Clear TID on mm_release()?	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_BLOCK	err = gpiochip_add(&port->bgc.gc);
+	p->plug = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_FUTEX	err = gpiochip_add(&port->bgc.gc);
+	p->robust_list = NULL;	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_COMPAT	err = gpiochip_add(&port->bgc.gc);
+	p->compat_robust_list = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&p->pi_state_list);	err = gpiochip_add(&port->bgc.gc);
+	p->pi_state_cache = NULL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * sigaltstack should be cleared when sharing the same VM	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if ((clone_flags & (CLONE_VM|CLONE_VFORK)) == CLONE_VM)	err = gpiochip_add(&port->bgc.gc);
+		p->sas_ss_sp = p->sas_ss_size = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Syscall tracing and stepping should be turned off in the	err = gpiochip_add(&port->bgc.gc);
+	 * child regardless of CLONE_PTRACE.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	user_disable_single_step(p);	err = gpiochip_add(&port->bgc.gc);
+	clear_tsk_thread_flag(p, TIF_SYSCALL_TRACE);	err = gpiochip_add(&port->bgc.gc);
+#ifdef TIF_SYSCALL_EMU	err = gpiochip_add(&port->bgc.gc);
+	clear_tsk_thread_flag(p, TIF_SYSCALL_EMU);	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	clear_all_latency_tracing(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* ok, now we should be set up.. */	err = gpiochip_add(&port->bgc.gc);
+	p->pid = pid_nr(pid);	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_THREAD) {	err = gpiochip_add(&port->bgc.gc);
+		p->exit_signal = -1;	err = gpiochip_add(&port->bgc.gc);
+		p->group_leader = current->group_leader;	err = gpiochip_add(&port->bgc.gc);
+		p->tgid = current->tgid;	err = gpiochip_add(&port->bgc.gc);
+	} else {	err = gpiochip_add(&port->bgc.gc);
+		if (clone_flags & CLONE_PARENT)	err = gpiochip_add(&port->bgc.gc);
+			p->exit_signal = current->group_leader->exit_signal;	err = gpiochip_add(&port->bgc.gc);
+		else	err = gpiochip_add(&port->bgc.gc);
+			p->exit_signal = (clone_flags & CSIGNAL);	err = gpiochip_add(&port->bgc.gc);
+		p->group_leader = p;	err = gpiochip_add(&port->bgc.gc);
+		p->tgid = p->pid;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p->nr_dirtied = 0;	err = gpiochip_add(&port->bgc.gc);
+	p->nr_dirtied_pause = 128 >> (PAGE_SHIFT - 10);	err = gpiochip_add(&port->bgc.gc);
+	p->dirty_paused_when = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p->pdeath_signal = 0;	err = gpiochip_add(&port->bgc.gc);
+	INIT_LIST_HEAD(&p->thread_group);	err = gpiochip_add(&port->bgc.gc);
+	p->task_works = NULL;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Make it visible to the rest of the system, but dont wake it up yet.	err = gpiochip_add(&port->bgc.gc);
+	 * Need tasklist lock for parent etc handling!	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	write_lock_irq(&tasklist_lock);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* CLONE_PARENT re-uses the old parent */	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & (CLONE_PARENT|CLONE_THREAD)) {	err = gpiochip_add(&port->bgc.gc);
+		p->real_parent = current->real_parent;	err = gpiochip_add(&port->bgc.gc);
+		p->parent_exec_id = current->parent_exec_id;	err = gpiochip_add(&port->bgc.gc);
+	} else {	err = gpiochip_add(&port->bgc.gc);
+		p->real_parent = current;	err = gpiochip_add(&port->bgc.gc);
+		p->parent_exec_id = current->self_exec_id;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	spin_lock(&current->sighand->siglock);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Process group and session signals need to be delivered to just the	err = gpiochip_add(&port->bgc.gc);
+	 * parent before the fork or both the parent and the child after the	err = gpiochip_add(&port->bgc.gc);
+	 * fork. Restart if a signal comes in before we add the new process to	err = gpiochip_add(&port->bgc.gc);
+	 * it's process group.	err = gpiochip_add(&port->bgc.gc);
+	 * A fatal signal pending means that current will exit, so the new	err = gpiochip_add(&port->bgc.gc);
+	 * thread can't slip out of an OOM kill (or normal SIGKILL).	err = gpiochip_add(&port->bgc.gc);
+	*/	err = gpiochip_add(&port->bgc.gc);
+	recalc_sigpending();	err = gpiochip_add(&port->bgc.gc);
+	if (signal_pending(current)) {	err = gpiochip_add(&port->bgc.gc);
+		spin_unlock(&current->sighand->siglock);	err = gpiochip_add(&port->bgc.gc);
+		write_unlock_irq(&tasklist_lock);	err = gpiochip_add(&port->bgc.gc);
+		retval = -ERESTARTNOINTR;	err = gpiochip_add(&port->bgc.gc);
+		goto bad_fork_free_pid;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (likely(p->pid)) {	err = gpiochip_add(&port->bgc.gc);
+		ptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		init_task_pid(p, PIDTYPE_PID, pid);	err = gpiochip_add(&port->bgc.gc);
+		if (thread_group_leader(p)) {	err = gpiochip_add(&port->bgc.gc);
+			init_task_pid(p, PIDTYPE_PGID, task_pgrp(current));	err = gpiochip_add(&port->bgc.gc);
+			init_task_pid(p, PIDTYPE_SID, task_session(current));	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+			if (is_child_reaper(pid)) {	err = gpiochip_add(&port->bgc.gc);
+				ns_of_pid(pid)->child_reaper = p;	err = gpiochip_add(&port->bgc.gc);
+				p->signal->flags |= SIGNAL_UNKILLABLE;	err = gpiochip_add(&port->bgc.gc);
+			}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+			p->signal->leader_pid = pid;	err = gpiochip_add(&port->bgc.gc);
+			p->signal->tty = tty_kref_get(current->signal->tty);	err = gpiochip_add(&port->bgc.gc);
+			list_add_tail(&p->sibling, &p->real_parent->children);	err = gpiochip_add(&port->bgc.gc);
+			list_add_tail_rcu(&p->tasks, &init_task.tasks);	err = gpiochip_add(&port->bgc.gc);
+			attach_pid(p, PIDTYPE_PGID);	err = gpiochip_add(&port->bgc.gc);
+			attach_pid(p, PIDTYPE_SID);	err = gpiochip_add(&port->bgc.gc);
+			__this_cpu_inc(process_counts);	err = gpiochip_add(&port->bgc.gc);
+		} else {	err = gpiochip_add(&port->bgc.gc);
+			current->signal->nr_threads++;	err = gpiochip_add(&port->bgc.gc);
+			atomic_inc(&current->signal->live);	err = gpiochip_add(&port->bgc.gc);
+			atomic_inc(&current->signal->sigcnt);	err = gpiochip_add(&port->bgc.gc);
+			list_add_tail_rcu(&p->thread_group,	err = gpiochip_add(&port->bgc.gc);
+					  &p->group_leader->thread_group);	err = gpiochip_add(&port->bgc.gc);
+			list_add_tail_rcu(&p->thread_node,	err = gpiochip_add(&port->bgc.gc);
+					  &p->signal->thread_head);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+		attach_pid(p, PIDTYPE_PID);	err = gpiochip_add(&port->bgc.gc);
+		nr_threads++;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	total_forks++;	err = gpiochip_add(&port->bgc.gc);
+	spin_unlock(&current->sighand->siglock);	err = gpiochip_add(&port->bgc.gc);
+	write_unlock_irq(&tasklist_lock);	err = gpiochip_add(&port->bgc.gc);
+	proc_fork_connector(p);	err = gpiochip_add(&port->bgc.gc);
+	cgroup_post_fork(p);	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_THREAD)	err = gpiochip_add(&port->bgc.gc);
+		threadgroup_change_end(current);	err = gpiochip_add(&port->bgc.gc);
+	perf_event_fork(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	trace_task_newtask(p, clone_flags);	err = gpiochip_add(&port->bgc.gc);
+	uprobe_copy_process(p, clone_flags);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return p;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+bad_fork_free_pid:	err = gpiochip_add(&port->bgc.gc);
+	if (pid != &init_struct_pid)	err = gpiochip_add(&port->bgc.gc);
+		free_pid(pid);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_io:	err = gpiochip_add(&port->bgc.gc);
+	if (p->io_context)	err = gpiochip_add(&port->bgc.gc);
+		exit_io_context(p);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_namespaces:	err = gpiochip_add(&port->bgc.gc);
+	exit_task_namespaces(p);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_mm:	err = gpiochip_add(&port->bgc.gc);
+	if (p->mm)	err = gpiochip_add(&port->bgc.gc);
+		mmput(p->mm);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_signal:	err = gpiochip_add(&port->bgc.gc);
+	if (!(clone_flags & CLONE_THREAD))	err = gpiochip_add(&port->bgc.gc);
+		free_signal_struct(p->signal);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_sighand:	err = gpiochip_add(&port->bgc.gc);
+	__cleanup_sighand(p->sighand);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_fs:	err = gpiochip_add(&port->bgc.gc);
+	exit_fs(p); /* blocking */	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_files:	err = gpiochip_add(&port->bgc.gc);
+	exit_files(p); /* blocking */	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_semundo:	err = gpiochip_add(&port->bgc.gc);
+	exit_sem(p);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_audit:	err = gpiochip_add(&port->bgc.gc);
+	audit_free(p);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_policy:	err = gpiochip_add(&port->bgc.gc);
+	perf_event_free_task(p);	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_NUMA	err = gpiochip_add(&port->bgc.gc);
+	mpol_put(p->mempolicy);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_cgroup:	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	if (clone_flags & CLONE_THREAD)	err = gpiochip_add(&port->bgc.gc);
+		threadgroup_change_end(current);	err = gpiochip_add(&port->bgc.gc);
+	cgroup_exit(p, 0);	err = gpiochip_add(&port->bgc.gc);
+	delayacct_tsk_free(p);	err = gpiochip_add(&port->bgc.gc);
+	module_put(task_thread_info(p)->exec_domain->module);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_cleanup_count:	err = gpiochip_add(&port->bgc.gc);
+	atomic_dec(&p->cred->user->processes);	err = gpiochip_add(&port->bgc.gc);
+	exit_creds(p);	err = gpiochip_add(&port->bgc.gc);
+bad_fork_free:	err = gpiochip_add(&port->bgc.gc);
+	free_task(p);	err = gpiochip_add(&port->bgc.gc);
+fork_out:	err = gpiochip_add(&port->bgc.gc);
+	return ERR_PTR(retval);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static inline void init_idle_pids(struct pid_link *links)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	enum pid_type type;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	for (type = PIDTYPE_PID; type < PIDTYPE_MAX; ++type) {	err = gpiochip_add(&port->bgc.gc);
+		INIT_HLIST_NODE(&links[type].node); /* not really needed */	err = gpiochip_add(&port->bgc.gc);
+		links[type].pid = &init_struct_pid;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+struct task_struct *fork_idle(int cpu)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct task_struct *task;	err = gpiochip_add(&port->bgc.gc);
+	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0);	err = gpiochip_add(&port->bgc.gc);
+	if (!IS_ERR(task)) {	err = gpiochip_add(&port->bgc.gc);
+		init_idle_pids(task->pids);	err = gpiochip_add(&port->bgc.gc);
+		init_idle(task, cpu);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return task;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ *  Ok, this is the main fork-routine.	err = gpiochip_add(&port->bgc.gc);
+ *	err = gpiochip_add(&port->bgc.gc);
+ * It copies the process, and if successful kick-starts	err = gpiochip_add(&port->bgc.gc);
+ * it and waits for it to finish using the VM if required.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+long do_fork(unsigned long clone_flags,	err = gpiochip_add(&port->bgc.gc);
+	      unsigned long stack_start,	err = gpiochip_add(&port->bgc.gc);
+	      unsigned long stack_size,	err = gpiochip_add(&port->bgc.gc);
+	      int __user *parent_tidptr,	err = gpiochip_add(&port->bgc.gc);
+	      int __user *child_tidptr)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct task_struct *p;	err = gpiochip_add(&port->bgc.gc);
+	int trace = 0;	err = gpiochip_add(&port->bgc.gc);
+	long nr;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Determine whether and which event to report to ptracer.  When	err = gpiochip_add(&port->bgc.gc);
+	 * called from kernel_thread or CLONE_UNTRACED is explicitly	err = gpiochip_add(&port->bgc.gc);
+	 * requested, no event is reported; otherwise, report if the event	err = gpiochip_add(&port->bgc.gc);
+	 * for the type of forking is enabled.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (!(clone_flags & CLONE_UNTRACED)) {	err = gpiochip_add(&port->bgc.gc);
+		if (clone_flags & CLONE_VFORK)	err = gpiochip_add(&port->bgc.gc);
+			trace = PTRACE_EVENT_VFORK;	err = gpiochip_add(&port->bgc.gc);
+		else if ((clone_flags & CSIGNAL) != SIGCHLD)	err = gpiochip_add(&port->bgc.gc);
+			trace = PTRACE_EVENT_CLONE;	err = gpiochip_add(&port->bgc.gc);
+		else	err = gpiochip_add(&port->bgc.gc);
+			trace = PTRACE_EVENT_FORK;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (likely(!ptrace_event_enabled(current, trace)))	err = gpiochip_add(&port->bgc.gc);
+			trace = 0;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	p = copy_process(clone_flags, stack_start, stack_size,	err = gpiochip_add(&port->bgc.gc);
+			 child_tidptr, NULL, trace);	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Do this prior waking up the new thread - the thread pointer	err = gpiochip_add(&port->bgc.gc);
+	 * might get invalid after that point, if the thread exits quickly.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (!IS_ERR(p)) {	err = gpiochip_add(&port->bgc.gc);
+		struct completion vfork;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		trace_sched_process_fork(current, p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		nr = task_pid_vnr(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (clone_flags & CLONE_PARENT_SETTID)	err = gpiochip_add(&port->bgc.gc);
+			put_user(nr, parent_tidptr);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (clone_flags & CLONE_VFORK) {	err = gpiochip_add(&port->bgc.gc);
+			p->vfork_done = &vfork;	err = gpiochip_add(&port->bgc.gc);
+			init_completion(&vfork);	err = gpiochip_add(&port->bgc.gc);
+			get_task_struct(p);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		wake_up_new_task(p);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		/* forking complete and child started to run, tell ptracer */	err = gpiochip_add(&port->bgc.gc);
+		if (unlikely(trace))	err = gpiochip_add(&port->bgc.gc);
+			ptrace_event(trace, nr);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (clone_flags & CLONE_VFORK) {	err = gpiochip_add(&port->bgc.gc);
+			if (!wait_for_vfork_done(p, &vfork))	err = gpiochip_add(&port->bgc.gc);
+				ptrace_event(PTRACE_EVENT_VFORK_DONE, nr);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	} else {	err = gpiochip_add(&port->bgc.gc);
+		nr = PTR_ERR(p);	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	return nr;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Create a kernel thread.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return do_fork(flags|CLONE_VM|CLONE_UNTRACED, (unsigned long)fn,	err = gpiochip_add(&port->bgc.gc);
+		(unsigned long)arg, NULL, NULL);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef __ARCH_WANT_SYS_FORK	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE0(fork)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_MMU	err = gpiochip_add(&port->bgc.gc);
+	return do_fork(SIGCHLD, 0, 0, NULL, NULL);	err = gpiochip_add(&port->bgc.gc);
+#else	err = gpiochip_add(&port->bgc.gc);
+	/* can not support in nommu mode */	err = gpiochip_add(&port->bgc.gc);
+	return -EINVAL;	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef __ARCH_WANT_SYS_VFORK	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE0(vfork)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return do_fork(CLONE_VFORK | CLONE_VM | SIGCHLD, 0,	err = gpiochip_add(&port->bgc.gc);
+			0, NULL, NULL);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifdef __ARCH_WANT_SYS_CLONE	err = gpiochip_add(&port->bgc.gc);
+#ifdef CONFIG_CLONE_BACKWARDS	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, parent_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		 int, tls_val,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, child_tidptr)	err = gpiochip_add(&port->bgc.gc);
+#elif defined(CONFIG_CLONE_BACKWARDS2)	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, parent_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, child_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		 int, tls_val)	err = gpiochip_add(&port->bgc.gc);
+#elif defined(CONFIG_CLONE_BACKWARDS3)	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE6(clone, unsigned long, clone_flags, unsigned long, newsp,	err = gpiochip_add(&port->bgc.gc);
+		int, stack_size,	err = gpiochip_add(&port->bgc.gc);
+		int __user *, parent_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		int __user *, child_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		int, tls_val)	err = gpiochip_add(&port->bgc.gc);
+#else	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, parent_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		 int __user *, child_tidptr,	err = gpiochip_add(&port->bgc.gc);
+		 int, tls_val)	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	return do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+#ifndef ARCH_MIN_MMSTRUCT_ALIGN	err = gpiochip_add(&port->bgc.gc);
+#define ARCH_MIN_MMSTRUCT_ALIGN 0	err = gpiochip_add(&port->bgc.gc);
+#endif	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+static void sighand_ctor(void *data)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct sighand_struct *sighand = data;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	spin_lock_init(&sighand->siglock);	err = gpiochip_add(&port->bgc.gc);
+	init_waitqueue_head(&sighand->signalfd_wqh);	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+void __init proc_caches_init(void)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	sighand_cachep = kmem_cache_create("sighand_cache",	err = gpiochip_add(&port->bgc.gc);
+			sizeof(struct sighand_struct), 0,	err = gpiochip_add(&port->bgc.gc);
+			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_DESTROY_BY_RCU|	err = gpiochip_add(&port->bgc.gc);
+			SLAB_NOTRACK, sighand_ctor);	err = gpiochip_add(&port->bgc.gc);
+	signal_cachep = kmem_cache_create("signal_cache",	err = gpiochip_add(&port->bgc.gc);
+			sizeof(struct signal_struct), 0,	err = gpiochip_add(&port->bgc.gc);
+			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);	err = gpiochip_add(&port->bgc.gc);
+	files_cachep = kmem_cache_create("files_cache",	err = gpiochip_add(&port->bgc.gc);
+			sizeof(struct files_struct), 0,	err = gpiochip_add(&port->bgc.gc);
+			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);	err = gpiochip_add(&port->bgc.gc);
+	fs_cachep = kmem_cache_create("fs_cache",	err = gpiochip_add(&port->bgc.gc);
+			sizeof(struct fs_struct), 0,	err = gpiochip_add(&port->bgc.gc);
+			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * FIXME! The "sizeof(struct mm_struct)" currently includes the	err = gpiochip_add(&port->bgc.gc);
+	 * whole struct cpumask for the OFFSTACK case. We could change	err = gpiochip_add(&port->bgc.gc);
+	 * this to *only* allocate as much of it as required by the	err = gpiochip_add(&port->bgc.gc);
+	 * maximum number of CPU's we can ever have.  The cpumask_allocation	err = gpiochip_add(&port->bgc.gc);
+	 * is at the end of the structure, exactly for that reason.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	mm_cachep = kmem_cache_create("mm_struct",	err = gpiochip_add(&port->bgc.gc);
+			sizeof(struct mm_struct), ARCH_MIN_MMSTRUCT_ALIGN,	err = gpiochip_add(&port->bgc.gc);
+			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_NOTRACK, NULL);	err = gpiochip_add(&port->bgc.gc);
+	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC);	err = gpiochip_add(&port->bgc.gc);
+	mmap_init();	err = gpiochip_add(&port->bgc.gc);
+	nsproxy_cache_init();	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Check constraints on flags passed to the unshare system call.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static int check_unshare_flags(unsigned long unshare_flags)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & ~(CLONE_THREAD|CLONE_FS|CLONE_NEWNS|CLONE_SIGHAND|	err = gpiochip_add(&port->bgc.gc);
+				CLONE_VM|CLONE_FILES|CLONE_SYSVSEM|	err = gpiochip_add(&port->bgc.gc);
+				CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWNET|	err = gpiochip_add(&port->bgc.gc);
+				CLONE_NEWUSER|CLONE_NEWPID))	err = gpiochip_add(&port->bgc.gc);
+		return -EINVAL;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * Not implemented, but pretend it works if there is nothing to	err = gpiochip_add(&port->bgc.gc);
+	 * unshare. Note that unsharing CLONE_THREAD or CLONE_SIGHAND	err = gpiochip_add(&port->bgc.gc);
+	 * needs to unshare vm.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM)) {	err = gpiochip_add(&port->bgc.gc);
+		/* FIXME: get_task_mm() increments ->mm_users */	err = gpiochip_add(&port->bgc.gc);
+		if (atomic_read(&current->mm->mm_users) > 1)	err = gpiochip_add(&port->bgc.gc);
+			return -EINVAL;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Unshare the filesystem structure if it is being shared	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static int unshare_fs(unsigned long unshare_flags, struct fs_struct **new_fsp)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct fs_struct *fs = current->fs;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (!(unshare_flags & CLONE_FS) || !fs)	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/* don't need lock here; in the worst case we'll do useless copy */	err = gpiochip_add(&port->bgc.gc);
+	if (fs->users == 1)	err = gpiochip_add(&port->bgc.gc);
+		return 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	*new_fsp = copy_fs_struct(fs);	err = gpiochip_add(&port->bgc.gc);
+	if (!*new_fsp)	err = gpiochip_add(&port->bgc.gc);
+		return -ENOMEM;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * Unshare file descriptor table if it is being shared	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+static int unshare_fd(unsigned long unshare_flags, struct files_struct **new_fdp)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct files_struct *fd = current->files;	err = gpiochip_add(&port->bgc.gc);
+	int error = 0;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if ((unshare_flags & CLONE_FILES) &&	err = gpiochip_add(&port->bgc.gc);
+	    (fd && atomic_read(&fd->count) > 1)) {	err = gpiochip_add(&port->bgc.gc);
+		*new_fdp = dup_fd(fd, &error);	err = gpiochip_add(&port->bgc.gc);
+		if (!*new_fdp)	err = gpiochip_add(&port->bgc.gc);
+			return error;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ * unshare allows a process to 'unshare' part of the process	err = gpiochip_add(&port->bgc.gc);
+ * context which was originally shared using clone.  copy_*	err = gpiochip_add(&port->bgc.gc);
+ * functions used by do_fork() cannot be used here directly	err = gpiochip_add(&port->bgc.gc);
+ * because they modify an inactive task_struct that is being	err = gpiochip_add(&port->bgc.gc);
+ * constructed. Here we are modifying the current, active,	err = gpiochip_add(&port->bgc.gc);
+ * task_struct.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+SYSCALL_DEFINE1(unshare, unsigned long, unshare_flags)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct fs_struct *fs, *new_fs = NULL;	err = gpiochip_add(&port->bgc.gc);
+	struct files_struct *fd, *new_fd = NULL;	err = gpiochip_add(&port->bgc.gc);
+	struct cred *new_cred = NULL;	err = gpiochip_add(&port->bgc.gc);
+	struct nsproxy *new_nsproxy = NULL;	err = gpiochip_add(&port->bgc.gc);
+	int do_sysvsem = 0;	err = gpiochip_add(&port->bgc.gc);
+	int err;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If unsharing a user namespace must also unshare the thread.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & CLONE_NEWUSER)	err = gpiochip_add(&port->bgc.gc);
+		unshare_flags |= CLONE_THREAD | CLONE_FS;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If unsharing a thread from a thread group, must also unshare vm.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & CLONE_THREAD)	err = gpiochip_add(&port->bgc.gc);
+		unshare_flags |= CLONE_VM;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If unsharing vm, must also unshare signal handlers.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & CLONE_VM)	err = gpiochip_add(&port->bgc.gc);
+		unshare_flags |= CLONE_SIGHAND;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * If unsharing namespace, must also unshare filesystem information.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & CLONE_NEWNS)	err = gpiochip_add(&port->bgc.gc);
+		unshare_flags |= CLONE_FS;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	err = check_unshare_flags(unshare_flags);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_unshare_out;	err = gpiochip_add(&port->bgc.gc);
+	/*	err = gpiochip_add(&port->bgc.gc);
+	 * CLONE_NEWIPC must also detach from the undolist: after switching	err = gpiochip_add(&port->bgc.gc);
+	 * to a new ipc namespace, the semaphore arrays from the old	err = gpiochip_add(&port->bgc.gc);
+	 * namespace are unreachable.	err = gpiochip_add(&port->bgc.gc);
+	 */	err = gpiochip_add(&port->bgc.gc);
+	if (unshare_flags & (CLONE_NEWIPC|CLONE_SYSVSEM))	err = gpiochip_add(&port->bgc.gc);
+		do_sysvsem = 1;	err = gpiochip_add(&port->bgc.gc);
+	err = unshare_fs(unshare_flags, &new_fs);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_unshare_out;	err = gpiochip_add(&port->bgc.gc);
+	err = unshare_fd(unshare_flags, &new_fd);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_unshare_cleanup_fs;	err = gpiochip_add(&port->bgc.gc);
+	err = unshare_userns(unshare_flags, &new_cred);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_unshare_cleanup_fd;	err = gpiochip_add(&port->bgc.gc);
+	err = unshare_nsproxy_namespaces(unshare_flags, &new_nsproxy,	err = gpiochip_add(&port->bgc.gc);
+					 new_cred, new_fs);	err = gpiochip_add(&port->bgc.gc);
+	if (err)	err = gpiochip_add(&port->bgc.gc);
+		goto bad_unshare_cleanup_cred;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	if (new_fs || new_fd || do_sysvsem || new_cred || new_nsproxy) {	err = gpiochip_add(&port->bgc.gc);
+		if (do_sysvsem) {	err = gpiochip_add(&port->bgc.gc);
+			/*	err = gpiochip_add(&port->bgc.gc);
+			 * CLONE_SYSVSEM is equivalent to sys_exit().	err = gpiochip_add(&port->bgc.gc);
+			 */	err = gpiochip_add(&port->bgc.gc);
+			exit_sem(current);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (new_nsproxy)	err = gpiochip_add(&port->bgc.gc);
+			switch_task_namespaces(current, new_nsproxy);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		task_lock(current);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (new_fs) {	err = gpiochip_add(&port->bgc.gc);
+			fs = current->fs;	err = gpiochip_add(&port->bgc.gc);
+			spin_lock(&fs->lock);	err = gpiochip_add(&port->bgc.gc);
+			current->fs = new_fs;	err = gpiochip_add(&port->bgc.gc);
+			if (--fs->users)	err = gpiochip_add(&port->bgc.gc);
+				new_fs = NULL;	err = gpiochip_add(&port->bgc.gc);
+			else	err = gpiochip_add(&port->bgc.gc);
+				new_fs = fs;	err = gpiochip_add(&port->bgc.gc);
+			spin_unlock(&fs->lock);	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (new_fd) {	err = gpiochip_add(&port->bgc.gc);
+			fd = current->files;	err = gpiochip_add(&port->bgc.gc);
+			current->files = new_fd;	err = gpiochip_add(&port->bgc.gc);
+			new_fd = fd;	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		task_unlock(current);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+		if (new_cred) {	err = gpiochip_add(&port->bgc.gc);
+			/* Install the new user namespace */	err = gpiochip_add(&port->bgc.gc);
+			commit_creds(new_cred);	err = gpiochip_add(&port->bgc.gc);
+			new_cred = NULL;	err = gpiochip_add(&port->bgc.gc);
+		}	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+bad_unshare_cleanup_cred:	err = gpiochip_add(&port->bgc.gc);
+	if (new_cred)	err = gpiochip_add(&port->bgc.gc);
+		put_cred(new_cred);	err = gpiochip_add(&port->bgc.gc);
+bad_unshare_cleanup_fd:	err = gpiochip_add(&port->bgc.gc);
+	if (new_fd)	err = gpiochip_add(&port->bgc.gc);
+		put_files_struct(new_fd);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+bad_unshare_cleanup_fs:	err = gpiochip_add(&port->bgc.gc);
+	if (new_fs)	err = gpiochip_add(&port->bgc.gc);
+		free_fs_struct(new_fs);	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+bad_unshare_out:	err = gpiochip_add(&port->bgc.gc);
+	return err;	err = gpiochip_add(&port->bgc.gc);
+}	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+/*	err = gpiochip_add(&port->bgc.gc);
+ *	Helper to unshare the files of the current task.	err = gpiochip_add(&port->bgc.gc);
+ *	We don't want to expose copy_files internals to	err = gpiochip_add(&port->bgc.gc);
+ *	the exec layer of the kernel.	err = gpiochip_add(&port->bgc.gc);
+ */	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+int unshare_files(struct files_struct **displaced)	err = gpiochip_add(&port->bgc.gc);
+{	err = gpiochip_add(&port->bgc.gc);
+	struct task_struct *task = current;	err = gpiochip_add(&port->bgc.gc);
+	struct files_struct *copy = NULL;	err = gpiochip_add(&port->bgc.gc);
+	int error;	err = gpiochip_add(&port->bgc.gc);
+	err = gpiochip_add(&port->bgc.gc);
+	error = unshare_fd(CLONE_FILES, &copy);	err = gpiochip_add(&port->bgc.gc);
+	if (error || !copy) {	err = gpiochip_add(&port->bgc.gc);
+		*displaced = NULL;	err = gpiochip_add(&port->bgc.gc);
+		return error;	err = gpiochip_add(&port->bgc.gc);
+	}	err = gpiochip_add(&port->bgc.gc);
+	*displaced = task->files;	err = gpiochip_add(&port->bgc.gc);
+	task_lock(task);	err = gpiochip_add(&port->bgc.gc);
+	task->files = copy;	err = gpiochip_add(&port->bgc.gc);
+	task_unlock(task);	err = gpiochip_add(&port->bgc.gc);
+	return 0;	err = gpiochip_add(&port->bgc.gc);
 }
