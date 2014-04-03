@@ -40,13 +40,14 @@ sub ChangeFiles{
 	close($filehandle);
 	
 	foreach my $file (@listOfFiles){
-		
-		open($filehandle, "<", $file)  or die "Can't open $file for input $!";
+		chomp $file;
+		open($filehandle, "<", $file) or die "Can't open $file for input $!";
 		my @origFileContents = <$filehandle>;
 		close($filehandle);
 		
-		open($filehandle, ">, $file") or die "Can't open $file for input $!";
+		open($filehandle, ">", $file) or die "Can't open $file for output $!";
 		foreach my $line(@origFileContents){
+			chomp $line;
 			#every 20 slocs
 			if($counter % 20 == 0){
 				print $filehandle $alterContents[$counter];
