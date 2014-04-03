@@ -45,7 +45,25 @@ sub GenerateFiles{
 	
 	for($counter = 0;$counter < 1000; $counter++){
 		if($counter < 300){
-			my $filename = $baseName."$counter".".txt"; 
+			my $filename = $baseName."$counter".".c"; 
+			open(my $countHandle, ">", $filename) or die "Can't open $filename for output $!";
+			print $countHandle @FileContents;
+			close($countHandle);
+		}
+		elsif($counter < 600){
+			my $dir = "directory_".$counter;
+			`mkdir $dir`;
+			
+			my $filename = $dir."/".$baseName."$counter".".c";
+			open(my $countHandle, ">", $filename) or die "Can't open $filename for output $!";
+			print $countHandle @FileContents;
+			close($countHandle);
+		}
+		else{
+			my $dir = "directory_".$counter;
+			`mkdir -p Level2/$dir`;
+			
+			my $filename = $dir."/".$baseName."$counter".".c";
 			open(my $countHandle, ">", $filename) or die "Can't open $filename for output $!";
 			print $countHandle @FileContents;
 			close($countHandle);
