@@ -6,7 +6,7 @@ use Getopt::Long;
 my $alteron = 0;
 
 my $BaseFile = "fork.c";
-
+my $alterFile = "Messiness.c";
 
 &ParseArgs();
 
@@ -29,9 +29,32 @@ sub ParseArgs{
 
 sub ChangeFiles{
 	print "Changing files here...\n";
-	
+	my $filehandle;
 	my @listOfFiles = `find . -name \*.c`;
+	print "starting a count\n";
+	my $counter = 0;
 	
+	open($filehandle, "<", $alterFile) or die "Can't open $alterFile for input $!";
+	my @alterContents = <$filehandle>;
+	close($filehandle);
+	
+	foreach my $file (@listOfFiles){
+		
+		open($filehandle, "<", $file)  or die "Can't open $file for input $!";
+		my @origFileContents = <$filehandle>;
+		close($filehandle);
+		
+		open($filehandle, ">, $file") or die "Can't open $file for input $!";
+		foreach my $line(@origFileContents){
+			#every 20 slocs
+			if($counter % 20 == 0){
+				print $filehandle $alterContents[$counter];
+			}
+			print $filehandle $line;
+		}
+		close($filehandle);
+		$counter++;
+	}
 	
 }
 
