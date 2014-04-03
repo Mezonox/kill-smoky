@@ -62,11 +62,16 @@ sub GenerateFiles{
 		else{
 			my $dir = "directory_".$counter;
 			`mkdir -p Level2/$dir`;
-			
-			my $filename = $dir."/".$baseName."$counter".".c";
+			if(-d "Level2"){
+			my $filename = "Level2/".$dir."/".$baseName."$counter".".c";
 			open(my $countHandle, ">", $filename) or die "Can't open $filename for output $!";
 			print $countHandle @FileContents;
 			close($countHandle);
+			}
+			else{
+				print "Level2 doesn't exist!\n";
+			}
+			
 		}
 	}
 	
