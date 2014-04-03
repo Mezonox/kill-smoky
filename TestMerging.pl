@@ -29,6 +29,10 @@ sub ParseArgs{
 
 sub ChangeFiles{
 	print "Changing files here...\n";
+	
+	my @listOfFiles = `find . -name \*.c`;
+	
+	
 }
 
 sub GenerateFiles{
