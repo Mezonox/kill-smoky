@@ -30,8 +30,9 @@ sub ParseArgs{
 sub ChangeFiles{
 	print "Changing files here...\n";
 	my $filehandle;
-	my @listOfFiles = `find . -name \*.c`;
+	my @listOfFiles = `find . -name \\*.c`;
 	print "starting a count\n";
+	
 	my $counter = 0;
 	
 	open($filehandle, "<", $alterFile) or die "Can't open $alterFile for input $!";
