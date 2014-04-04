@@ -49,7 +49,7 @@ sub ChangeFiles{
 		foreach my $line(@origFileContents){
 			chomp $line;
 			#every 20 slocs
-			if($counter % 25 == 0){
+			if($counter % 30 == 0){
 				print $filehandle $alterContents[$counter];
 			}
 			print $filehandle $line;
